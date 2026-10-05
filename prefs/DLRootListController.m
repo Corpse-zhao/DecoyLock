@@ -1,14 +1,25 @@
+//
+//  DLRootListController.m
+//  伪锁屏 DecoyLock 设置面板
+//
+//  ⚠️ 架构决策（v0.1.4，推翻 v0.1.3 的 specifier 手搓方案）：
+//    - 主面板：仍然用 PSListController + Root.plist（plist 驱动的开关/输入框，最稳）
+//    - 输入框：改用 PSEditTextCell（PSLinkCell 跳转），不再用 PSTextFieldSpecifier
+//      —— 后者现代 iOS 上点击常无反应（用户实测「伪密码点击不了」）
+//    - App 选择器：改用【纯原生 UITableViewController】，彻底不碰 PSSpecifier 私有构造
+//      —— [PSSpecifier new] + setValue:forKey: 极脆弱，是「点击闪退」的根因
+//
 #import "DLRootListController.h"
 #import <notify.h>
 #import <spawn.h>
 #import <sys/wait.h>
 
-// ---------------------------------------------------------------------------
-// 设置面板（运行在「设置」App 进程，不受沙盒限制）
-// 配置写共享目录 /var/mobile/Documents/伪锁屏/_config.plist + NSUserDefaults(suite)
-// ---------------------------------------------------------------------------
-
+// 配置域
 static NSString *const kDLDomain = @"com.blr.decoylock";
+
+// ---------------------------------------------------------------------------
+// 配置读写（共享目录 + NSUserDefaults，SpringBoard 侧可读）
+// ---------------------------------------------------------------------------
 
 static NSString *DLPrefsDir(void) {
     NSString *base = @"/var/mobile/Documents";
@@ -66,10 +77,20 @@ static NSArray *DLFakeApps(void) {
     ];
 }
 
+static NSArray *DLDefaultSelection(void) {
+    return @[@"phone", @"message", @"camera", @"settings"];
+}
+
 #pragma mark - 前向声明（类扩展须写在所有实现之前）
 
 @interface DLAppPickerController ()
 @property (nonatomic, strong) NSMutableSet *selected;
+@end
+
+@interface DLTextEditController : PSListController
+@property (nonatomic, copy) NSString *cfgKey;
+@property (nonatomic, copy) NSString *cfgTitle;
+@property (nonatomic, assign) BOOL numericOnly;
 @end
 
 #pragma mark - 主面板
@@ -84,15 +105,11 @@ static NSArray *DLFakeApps(void) {
     return _specifiers;
 }
 
-// 首次进入时把推荐默认值落盘（避免插件读到空配置）
 - (void)migrateDefaultsIfNeeded {
     NSMutableDictionary *cfg = DLPrefsLoad();
     BOOL changed = NO;
     if (!cfg[@"decoy_title"])  { cfg[@"decoy_title"] = @"我的 iPhone"; changed = YES; }
-    if (!cfg[@"decoy_apps"]) {
-        cfg[@"decoy_apps"] = @[@"phone", @"message", @"camera", @"settings"];
-        changed = YES;
-    }
+    if (!cfg[@"decoy_apps"])   { cfg[@"decoy_apps"] = DLDefaultSelection(); changed = YES; }
     if (!cfg[@"enabled"])      { cfg[@"enabled"] = @NO; changed = YES; }
     if (changed) DLPrefsSave(cfg);
 }
@@ -102,10 +119,7 @@ static NSArray *DLFakeApps(void) {
     NSDictionary *cfg = DLPrefsLoad();
     id v = cfg[key];
     if (v) return v;
-
-    // 兜底：Plist 里声明的 default
-    id def = [spec propertyForKey:@"default"];
-    return def;
+    return [spec propertyForKey:@"default"];
 }
 
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)spec {
@@ -115,7 +129,6 @@ static NSArray *DLFakeApps(void) {
     cfg[key] = value;
     DLPrefsSave(cfg);
 
-    // 伪密码改动 → 清一次诊断日志，方便对照
     if ([key isEqualToString:@"decoy_passcode"]) {
         [[NSFileManager defaultManager] removeItemAtPath:DLPrefsProbePath() error:NULL];
     }
@@ -124,6 +137,12 @@ static NSArray *DLFakeApps(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"伪锁屏";
+}
+
+// 从 plist 里读当前值（给自定义编辑页用）
+- (id)valueForKey:(NSString *)key fallback:(id)fb {
+    id v = DLPrefsLoad()[key];
+    return v ?: fb;
 }
 
 // ------------------------------ 按钮动作 ------------------------------
@@ -151,7 +170,6 @@ static NSArray *DLFakeApps(void) {
                                                   error:NULL];
     if (!text.length) text = @"（暂无日志）\n\n请先：① 确认总开关已打开 ② 设好伪密码\n③ 执行一次「重启桌面」 ④ 在锁屏输入伪密码";
 
-    // 诊断里补上「配置当前状态」，一行看清问题出在哪
     NSMutableDictionary *cfg = DLPrefsLoad();
     NSString *header = [NSString stringWithFormat:
         @"【当前配置】\n启用=%@\n伪密码=%@\n假App=%@\n配置路径=%@\n\n【运行日志（尾部）】\n",
@@ -193,31 +211,24 @@ static NSArray *DLFakeApps(void) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
+// ⚠️ plist 里的 PSLinkCell 会调这个方法跳到自定义编辑页
+- (void)pushTextEditor:(PSSpecifier *)spec {
+    NSString *key = [spec propertyForKey:@"cfgKey"] ?: [spec propertyForKey:@"key"];
+    DLTextEditController *vc = [[DLTextEditController alloc] init];
+    vc.cfgKey = key;
+    vc.cfgTitle = [spec propertyForKey:@"label"] ?: @"编辑";
+    vc.numericOnly = [[spec propertyForKey:@"numericOnly"] boolValue];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
 @end
 
-#pragma mark - 假 App 选择器
+#pragma mark - 纯原生 App 选择器（不碰 PSSpecifier）
 
 @implementation DLAppPickerController
 
-- (NSArray *)specifiers {
-    if (_specifiers) return _specifiers;
-
-    NSMutableArray *specs = [NSMutableArray array];
-    PSSpecifier *group = [PSSpecifier new];
-    [group setValue:@"勾选后显示在假空间里。点右上角「完成」保存。" forKey:@"footerText"];
-    [group setValue:@"假空间 App" forKey:@"label"];
-    [specs addObject:group];
-
-    for (NSDictionary *a in DLFakeApps()) {
-        PSSpecifier *s = [PSSpecifier new];
-        [s setValue:a[@"name"] forKey:@"label"];
-        [s setValue:a[@"id"] forKey:@"appid"];
-        [s setValue:( [self.selected containsObject:a[@"id"]] ? @1 : @0 ) forKey:@"checked"];
-        [specs addObject:s];
-    }
-
-    _specifiers = specs;
-    return _specifiers;
+- (instancetype)init {
+    return [super initWithStyle:UITableViewStyleInsetGrouped];
 }
 
 - (void)viewDidLoad {
@@ -226,9 +237,7 @@ static NSArray *DLFakeApps(void) {
 
     NSMutableDictionary *cfg = DLPrefsLoad();
     NSArray *cur = cfg[@"decoy_apps"];
-    if (![cur isKindOfClass:[NSArray class]] || !cur.count) {
-        cur = @[@"phone", @"message", @"camera", @"settings"];
-    }
+    if (![cur isKindOfClass:[NSArray class]] || !cur.count) cur = DLDefaultSelection();
     self.selected = [NSMutableSet setWithArray:cur];
 
     self.navigationItem.rightBarButtonItem =
@@ -239,51 +248,38 @@ static NSArray *DLFakeApps(void) {
 
 - (void)save {
     NSMutableDictionary *cfg = DLPrefsLoad();
-    NSArray *ordered = [DLFakeApps() dlOrderWithSelection:self.selected];
+    // 保持内置清单顺序
+    NSMutableArray *ordered = [NSMutableArray array];
+    for (NSDictionary *a in DLFakeApps()) {
+        if ([self.selected containsObject:a[@"id"]]) [ordered addObject:a[@"id"]];
+    }
     cfg[@"decoy_apps"] = ordered;
     DLPrefsSave(cfg);
     [self.navigationController popViewControllerAnimated:YES];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
-    return 1;
-}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return (NSInteger)DLFakeApps().count + 1;   // +1 = 顶部说明行
+    return (NSInteger)DLFakeApps().count;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return @"勾选后显示在假空间里，点右上角「完成」保存";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    // ⚠️ 不要依赖 [super tableView:...] —— 私有 PSListController 的方法名不同版本有差异。
-    //    自己构造 cell，完全可控。
     static NSString *cellID = @"DLAppPickerCell";
     UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cellID];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
                                       reuseIdentifier:cellID];
     }
-    cell.textLabel.text = @"";
-    cell.accessoryType = UITableViewCellAccessoryNone;
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-
-    if (ip.section != 0) return cell;
-
-    if (ip.row == 0) {
-        cell.textLabel.text = @"勾选后显示在假空间里";
-        cell.textLabel.textColor = [UIColor secondaryLabelColor];
-        cell.textLabel.font = [UIFont systemFontOfSize:13.0];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        return cell;
-    }
-
-    NSInteger idx = ip.row - 1;
     NSArray *all = DLFakeApps();
-    if (idx < 0 || idx >= (NSInteger)all.count) return cell;
+    if (ip.row < 0 || ip.row >= (NSInteger)all.count) return cell;
 
-    NSString *ident = all[(NSUInteger)idx][@"id"];
-    cell.textLabel.text = all[(NSUInteger)idx][@"name"];
-    cell.textLabel.textColor = [UIColor labelColor];
-    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
+    NSString *ident = all[(NSUInteger)ip.row][@"id"];
+    cell.textLabel.text = all[(NSUInteger)ip.row][@"name"];
     cell.accessoryType = [self.selected containsObject:ident]
         ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     return cell;
@@ -291,27 +287,77 @@ static NSArray *DLFakeApps(void) {
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
-    if (ip.section != 0 || ip.row == 0) return;
-    NSInteger idx = ip.row - 1;
     NSArray *all = DLFakeApps();
-    if (idx < 0 || idx >= (NSInteger)all.count) return;
-    NSString *ident = all[(NSUInteger)idx][@"id"];
+    if (ip.row < 0 || ip.row >= (NSInteger)all.count) return;
 
+    NSString *ident = all[(NSUInteger)ip.row][@"id"];
     if ([self.selected containsObject:ident]) [self.selected removeObject:ident];
-    else                                     [self.selected addObject:ident];
+    else                                      [self.selected addObject:ident];
 
-    [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+    [tv reloadRowsAtIndexPaths:@[ip] withAnimation:UITableViewRowAnimationNone];
 }
 
 @end
 
-// NSArray 的便捷排序（保持内置清单顺序，不按勾选顺序）
-@implementation NSArray (DLOrder)
-- (NSArray *)dlOrderWithSelection:(NSSet *)sel {
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSDictionary *a in DLFakeApps()) {
-        if ([sel containsObject:a[@"id"]]) [out addObject:a[@"id"]];
+#pragma mark - 纯原生文本编辑页（替代 PSTextFieldSpecifier）
+
+@implementation DLTextEditController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = self.cfgTitle ?: @"编辑";
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemSave
+                                                      target:self
+                                                      action:@selector(save)];
+
+    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(20, 0,
+                            self.view.bounds.size.width - 40, 44)];
+    tf.borderStyle = UITextBorderStyleRoundedRect;
+    tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    if (self.numericOnly) {
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.secureTextEntry = YES;
     }
-    return out;
+    tf.text = DLPrefsLoad()[self.cfgKey] ?: @"";
+    tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    tf.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.textField = tf;
+
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
+                            self.view.bounds.size.width, 60)];
+    header.backgroundColor = [UIColor clearColor];
+    tf.center = CGPointMake(header.bounds.size.width / 2.0, 30);
+    [header addSubview:tf];
+
+    UITableView *tv = (UITableView *)self.view;
+    tv.tableHeaderView = header;
+    [tf becomeFirstResponder];
 }
+
+- (void)save {
+    NSString *v = self.textField.text ?: @"";
+    if (self.numericOnly) {
+        // 只保留数字
+        NSMutableString *digits = [NSMutableString string];
+        for (NSUInteger i = 0; i < v.length; i++) {
+            unichar c = [v characterAtIndex:i];
+            if (c >= '0' && c <= '9') [digits appendFormat:@"%C", c];
+        }
+        v = digits;
+    }
+    NSMutableDictionary *cfg = DLPrefsLoad();
+    cfg[self.cfgKey] = v;
+    DLPrefsSave(cfg);
+
+    if ([self.cfgKey isEqualToString:@"decoy_passcode"]) {
+        [[NSFileManager defaultManager] removeItemAtPath:DLPrefsProbePath() error:NULL];
+    }
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 0; }
+
 @end
