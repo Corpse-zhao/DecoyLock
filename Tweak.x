@@ -95,6 +95,9 @@ static void DLResetInput(void) {
     gDLInputStamp = 0.0;
 }
 
+// v0.1.10：输入捕获自检（定义在后面，先声明）
+static void DLLogInputCapture(NSString *src);
+
 // ---------------------------------------------------------------------------
 // 覆盖式写入：密码框给什么，缓冲就是什么。
 // 直接用 setText: 的真实内容，比「自己 append 按键」准确得多
@@ -110,6 +113,7 @@ static void DLSetInput(NSString *text, NSString *src) {
 
     DLProbe(@"[输入] 源=%@ 内容=%@ len=%lu",
             gDLLastSrc, t.length ? t : @"(空)", (unsigned long)t.length);
+    DLLogInputCapture(gDLLastSrc);
 }
 
 static void DLAppendInput(NSString *text, NSString *src) {
@@ -123,6 +127,7 @@ static void DLAppendInput(NSString *text, NSString *src) {
     gDLLastSrc = src ?: @"?";
     DLProbe(@"[输入] 源=%@ 追加=%@ 结果 len=%lu",
             gDLLastSrc, text, (unsigned long)DLInputBuffer().length);
+    DLLogInputCapture(gDLLastSrc);      // v0.1.10：长度够了就打一行
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +275,8 @@ static void DLEnsureReconForPasscodeField(id field);
     %orig;
     DLAppendInput(s, @"entry.append");
     DLReconOpenWindow();
-    DLEnsureReconForPasscodeField(self);   // delegate 类侦查（幂等）
+    // v0.1.10：每次输入都沿「视图/响应者/delegate」链上行侦查（内部幂等）
+    DLEnsureReconForPasscodeField(self);
 }
 - (void)clear {
     %orig;
@@ -785,13 +791,60 @@ static void DLReconClass(Class c, NSString *reason) {
 static void DLEnsureReconForPasscodeField(id field) {
     @try {
         if (!field || !DLIsSpringBoard()) return;
-        if (![field respondsToSelector:@selector(delegate)]) return;
+
+        // ⭐ v0.1.10 关键修正
+        //
+        // v0.1.9 日志：「[侦查挂] SBUIPasscodeLockViewSimpleFixedDigitKeypad
+        //              （delegate）：挂 0 个，跳过 0 个」
+        //   → 密码框的 delegate 只是一个「画键盘的 view」，
+        //     它不负责验证密码，自然不会实现白名单里的验证方法。
+        //
+        //   验证者其实是**上一层的锁屏 view controller**（在它的视图树里）。
+        //   但 SBLockScreenViewController 这个类名在本系统不存在（自检已 ❌），
+        //   所以不能硬编码 —— 改成**沿「视图 / 响应者 / delegate」链一路上行**，
+        //   每一层的类都试一次侦查挂钩（幂等，挂不到就跳过，完全安全）。
+        NSMutableArray<Class> *candidates = [NSMutableArray array];
+
+        // ① 自己
+        if ([field isKindOfClass:[NSObject class]]) [candidates addObject:[field class]];
+
+        // ② delegate
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id dlg = [field performSelector:@selector(delegate)];
+        if ([field respondsToSelector:@selector(delegate)]) {
+            id dlg = [field performSelector:@selector(delegate)];
+            if (dlg) [candidates addObject:[dlg class]];
+        }
+        // ③ superview 链（最多 12 层）—— 密码框往上找，锁屏 VC 一定在这一串里
+        if ([field isKindOfClass:[UIView class]]) {
+            UIView *p = [(UIView *)field superview];
+            int guard = 0;
+            while (p && guard++ < 12) {
+                [candidates addObject:[p class]];
+                p = p.superview;
+            }
+        }
+        // ④ nextResponder 链（最多 12 层）—— UIViewController 就是靠这个上来的
+        if ([field respondsToSelector:@selector(nextResponder)]) {
+            id r = [field performSelector:@selector(nextResponder)];
+            int guard = 0;
+            while (r && guard++ < 12) {
+                [candidates addObject:[r class]];
+                r = [r respondsToSelector:@selector(nextResponder)]
+                    ? [r performSelector:@selector(nextResponder)] : nil;
+            }
+        }
 #pragma clang diagnostic pop
-        if (!dlg) return;
-        DLReconClass([dlg class], @"delegate");
+
+        // 去重后逐个尝试（DLReconClass 内部幂等 + 自动跳过非系统镜像/无白名单方法的类）
+        NSMutableSet *seen = [NSMutableSet set];
+        for (Class c in candidates) {
+            if (!c) continue;
+            NSString *cn = NSStringFromClass(c);
+            if (!cn.length || [seen containsObject:cn]) continue;
+            [seen addObject:cn];
+            DLReconClass(c, @"上行链");
+        }
     } @catch (__unused NSException *e) { }
 }
 
@@ -820,7 +873,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.9 稳定侦查版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.10 上行链侦查版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -848,6 +901,74 @@ static void DLDumpEnvironment(void) {
             NSSelectorFromString(@"attemptUnlockWithPasscode:"));
         DLProbe(@"[自检] 类 %@ : ✅ 存在  setText:=%d  attempt=%d",
                 cn, hasSetText, am != NULL);
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ v0.1.10：环境清点（只观察，不挂钩）
+    //
+    // v0.1.9 日志告诉我们三件事：
+    //   ① 输入捕获 ✅（entry.append 走通）
+    //   ② attemptUnlockWithPasscode: 挂在 SBLockScreenManager 上，但没被调用
+    //   ③ 密码框 delegate 的类 = SBUIPasscodeLockViewSimpleFixedDigitKeypad，
+    //      它**自身没实现**任何白名单方法（挂 0 跳过 0）
+    //      → 验证方法在**别的对象**上。最可能是「锁屏 view controller」。
+    //      但 SBLockScreenViewController 这个类名在本系统不存在（上面已 ❌）。
+    //      → 所以本版直接把 runtime 里**所有**名字可疑的类清点出来，
+    //        用户下次一锁屏输入，日志就会列出真正的验证者类名。
+    // -----------------------------------------------------------------------
+    NSMutableArray *suspects = [NSMutableArray array];
+    unsigned int classCount = 0;
+    Class *allClasses = objc_copyClassList(&classCount);
+    if (allClasses) {
+        for (unsigned int i = 0; i < classCount; i++) {
+            Class c = allClasses[i];
+            if (!c) continue;
+            NSString *n = NSStringFromClass(c);
+            if (!n.length) continue;
+            // 只看有嫌疑的名字（视图控制器 / 密码 / 锁屏 / 设备锁）
+            BOOL suspect = ([n containsString:@"Passcode"] ||
+                            [n containsString:@"LockScreen"] ||
+                            [n containsString:@"DeviceLock"] ||
+                            [n containsString:@"Pearl"]);
+            if (!suspect) continue;
+            // 排除我们自己/系统无关的
+            if ([n hasPrefix:@"DL"]) continue;
+            const char *img = class_getImageName(c);
+            NSString *imgName = img ? [[NSString stringWithUTF8String:img] lastPathComponent]
+                                    : @"?";
+            // 统计它实现的「白名单」方法数，方便一眼看出谁是验证者
+            int wlCount = 0;
+            NSArray *wl = DLReconWhiteList();
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(c, &mc);
+            if (ms) {
+                for (unsigned int j = 0; j < mc; j++) {
+                    if ([wl containsObject:NSStringFromSelector(method_getName(ms[j]))])
+                        wlCount++;
+                }
+                free(ms);
+            }
+            [suspects addObject:[NSString stringWithFormat:@"%@(%@,白名单%d)",
+                                 n, imgName, wlCount]];
+        }
+        free(allClasses);
+    }
+    DLProbe(@"[清点] 名字可疑的类共 %lu 个：%@",
+            (unsigned long)suspects.count,
+            [suspects componentsJoinedByString:@" | "]);
+}
+
+// ---------------------------------------------------------------------------
+// ⭐ v0.1.10：输入捕获自检（用户说「输够 6 位」时立即打一行）
+//    这样能立刻区分两种失败：
+//      a) 系统根本没走 appendString:（len 涨不上去）→ 输入捕获失效
+//      b) len 到了 6 但从没进判定分支 → 阈值/判定条件写错了
+// ---------------------------------------------------------------------------
+static void DLLogInputCapture(NSString *src) {
+    NSUInteger len = DLInputBuffer().length;
+    if (len == DLDecoyPasscode().length && len > 0) {
+        DLProbe(@"✅ 输入长度已达伪密码位数（%lu 位，源=%@）→ 等待系统验证调用",
+                (unsigned long)len, src);
     }
 }
 
