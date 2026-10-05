@@ -212,41 +212,11 @@ static void DLDoRespring(void) {
     }
 }
 
+// ⚠️ v0.1.6：诊断页从「UIAlert 弹窗」改为【自建全屏可滚动查看器】。
+//    原因：日志是几十行，UIAlert 的 message 区域根本显示不全，
+//    用户没法把内容抄出来发给我 —— 这是上一轮排查卡住的关键。
 - (void)showProbe {
-    NSString *text = [NSString stringWithContentsOfFile:DLPrefsProbePath()
-                                               encoding:NSUTF8StringEncoding
-                                                  error:NULL];
-    if (!text.length) text = @"（暂无日志）\n\n请先：① 确认总开关已打开 ② 设好伪密码\n③ 执行一次「重启桌面」 ④ 在锁屏输入伪密码";
-
-    NSMutableDictionary *cfg = DLPrefsLoad();
-    NSString *header = [NSString stringWithFormat:
-        @"【当前配置】\n启用=%@\n伪密码=%@\n假App=%@\n配置路径=%@\n\n【运行日志（尾部）】\n",
-        [cfg[@"enabled"] boolValue] ? @"是" : @"否",
-        ([cfg[@"decoy_passcode"] length] > 0) ? @"已设置" : @"未设置",
-        [cfg[@"decoy_apps"] componentsJoinedByString:@","] ?: @"(默认)",
-        DLPrefsConfigPath()];
-
-    NSMutableString *body = [NSMutableString stringWithString:header];
-    if (text.length > 6000) {
-        [body appendString:[text substringFromIndex:text.length - 6000]];
-    } else {
-        [body appendString:text];
-    }
-
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectZero];
-    tv.text = body;
-    tv.editable = NO;
-    tv.font = [UIFont fontWithName:@"Menlo" size:11.0] ?: [UIFont systemFontOfSize:11.0];
-    tv.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-
-    UIViewController *vc = [[UIViewController alloc] init];
-    vc.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-    vc.title = @"运行诊断";
-    tv.frame = vc.view.bounds;
-    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    tv.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
-    [vc.view addSubview:tv];
-
+    DLProbeController *vc = [[DLProbeController alloc] initWithStyle:UITableViewStylePlain];
     [self.navigationController pushViewController:vc animated:YES];
 }
 
@@ -276,6 +246,135 @@ static void DLDoRespring(void) {
     DLAppPickerController *vc = [[DLAppPickerController alloc]
         initWithStyle:UITableViewStyleInsetGrouped];
     [self.navigationController pushViewController:vc animated:YES];
+}
+
+@end
+
+#pragma mark - 诊断日志查看器（自建，纯原生）
+// ⚠️ 不能用 UIAlertController 的 message 显示长日志 —— 显示不全且无法复制。
+//    这里用 UITableView：每行一条日志，可滚动；右上角一键复制全文。
+//    行高固定 22pt + numberOfLines = 0，日志换行也能完整展开。
+
+@implementation DLProbeController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"运行诊断";
+    self.tableView.rowHeight = 22.0;
+    self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
+    self.tableView.backgroundColor = [UIColor systemGroupedBackgroundColor];
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(copyAll)];
+    [self reload];
+}
+
+- (void)reload {
+    NSMutableDictionary *cfg = DLPrefsLoad();
+
+    NSString *raw = [NSString stringWithContentsOfFile:DLPrefsProbePath()
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+    if (!raw.length) raw = @"（暂无日志）";
+
+    NSMutableArray *lines = [NSMutableArray array];
+
+    // ---- 配置摘要（放最前面，一眼能看出「开关没开」/「密码没设」）----
+    [lines addObject:[NSString stringWithFormat:@"═══ 当前配置 ═══"]];
+    [lines addObject:[NSString stringWithFormat:@"总开关: %@",
+        [cfg[@"enabled"] boolValue] ? @"✅ 已开启" : @"❌ 未开启（插件不生效！）"]];
+    [lines addObject:[NSString stringWithFormat:@"伪密码: %@",
+        ([cfg[@"decoy_passcode"] length] > 0)
+            ? [NSString stringWithFormat:@"✅ 已设置（%lu 位）",
+                (unsigned long)[cfg[@"decoy_passcode"] length]]
+            : @"❌ 未设置（插件不生效！）"]];
+    [lines addObject:[NSString stringWithFormat:@"假空间App: %@",
+        [cfg[@"decoy_apps"] count] ? [cfg[@"decoy_apps"] componentsJoinedByString:@","] : @"(默认)"]];
+    [lines addObject:[NSString stringWithFormat:@"配置文件: %@", DLPrefsConfigPath()]];
+    [lines addObject:[NSString stringWithFormat:@"文件存在: %@",
+        [[NSFileManager defaultManager] fileExistsAtPath:DLPrefsConfigPath()] ? @"是" : @"否"]];
+    [lines addObject:@" "];
+    [lines addObject:@"═══ 运行日志（最新在最后）═══"];
+
+    // 日志太长只取尾部 —— 关心的永远是最近一次锁屏操作
+    NSString *tail = raw;
+    if (tail.length > 12000) {
+        tail = [tail substringFromIndex:tail.length - 12000];
+    }
+    for (NSString *l in [tail componentsSeparatedByString:@"\n"]) {
+        [lines addObject:l];
+    }
+
+    self.lines = lines;
+    self.plain = [lines componentsJoinedByString:@"\n"];
+    [self.tableView reloadData];
+
+    // 自动滚到底部（最新一条）
+    NSUInteger n = self.lines.count;
+    if (n > 0) {
+        [self.tableView scrollToRowAtIndexPath:
+            [NSIndexPath indexPathForRow:(NSInteger)n - 1 inSection:0]
+                              atScrollPosition:UITableViewScrollPositionBottom
+                                      animated:NO];
+    }
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return (NSInteger)self.lines.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *cellID = @"DLProbeCell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cellID];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                      reuseIdentifier:cellID];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.numberOfLines = 0;
+
+        // 错误时不需要打印整行日志，所以保留等宽字体便于对齐阅读
+        cell.textLabel.font = [UIFont fontWithName:@"Menlo" size:10.5]
+                              ?: [UIFont systemFontOfSize:10.5];
+    }
+    if (ip.row < 0 || ip.row >= (NSInteger)self.lines.count) return cell;
+
+    NSString *line = self.lines[(NSUInteger)ip.row];
+    cell.textLabel.text = line;
+
+    // 关键行着色，方便肉眼快速定位
+    if ([line hasPrefix:@"═══"]) {
+        cell.textLabel.textColor = [UIColor labelColor];
+        cell.textLabel.font = [UIFont boldSystemFontOfSize:11.0];
+    } else if ([line containsString:@"***"] || [line containsString:@"✅"] ||
+               [line containsString:@"命中"]) {
+        cell.textLabel.textColor = [UIColor systemGreenColor];
+        cell.textLabel.font = [UIFont fontWithName:@"Menlo-Bold" size:10.5]
+                              ?: [UIFont boldSystemFontOfSize:10.5];
+    } else if ([line containsString:@"❌"] || [line containsString:@"失败"] ||
+               [line containsString:@"不存在"]) {
+        cell.textLabel.textColor = [UIColor systemRedColor];
+        cell.textLabel.font = [UIFont fontWithName:@"Menlo" size:10.5]
+                              ?: [UIFont systemFontOfSize:10.5];
+    } else {
+        cell.textLabel.textColor = [UIColor secondaryLabelColor];
+        cell.textLabel.font = [UIFont fontWithName:@"Menlo" size:10.5]
+                              ?: [UIFont systemFontOfSize:10.5];
+    }
+    return cell;
+}
+
+- (void)copyAll {
+    [UIPasteboard generalPasteboard].string = self.plain ?: @"";
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"已复制"
+                         message:@"全部诊断内容已复制到剪贴板，直接粘贴发给我即可。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 @end

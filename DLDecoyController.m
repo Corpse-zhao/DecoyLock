@@ -133,7 +133,7 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 static DLDecoyController *sShared = nil;
 
 + (BOOL)isShowing {
-    return sShared != nil && sShared.view.window != nil;
+    return sShared != nil && sShared.view.window != nil && !sShared.view.window.hidden;
 }
 
 + (void)presentIfConfigured {
@@ -149,48 +149,72 @@ static DLDecoyController *sShared = nil;
         DLProbe(@"decoy 跳过：已在展示中");
         return;
     }
-
-    NSString *decoy = DLDecoyPasscode();
-    (void)decoy;
+    // 残留状态清掉（窗口被系统拆掉但 sShared 还没释放的兜底），
+    // 否则用户会「点进去一次之后再也没反应」
+    if (sShared) {
+        DLProbe(@"decoy 清理残留实例");
+        [self dismissDecoy];
+    }
 
     DLDecoyController *vc = [[DLDecoyController alloc] init];
-    vc.modalPresentationStyle = UIModalPresentationFullScreen;
     sShared = vc;
 
-    // 拿到当前最上层窗口呈现
+    // ⚠️ 关键：不能用「锁屏那个 key window」来 present。
+    //    锁屏的窗口会随解锁流程被系统拆掉，模态一挂上去就跟着消失；
+    //    而且锁屏状态下 isKeyWindow 常常取不到合适的窗口。
+    //    正解 = 自建一个独立 UIWindow，windowLevel 拉到 UIWindowLevelAlert 之上
+    //    （SpringBoard 自己就用这个手法盖系统 UI），窗口生命周期由我们掌控。
     UIWindow *win = nil;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-            if (w.isKeyWindow) { win = w; break; }
+
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = nil;
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            // 优先要前台活跃的那个 scene
+            if (ws.activationState == UISceneActivationStateForegroundActive) {
+                scene = ws;
+                break;
+            }
+            if (!scene) scene = ws;
         }
-        if (win) break;
+        if (scene) {
+            win = [[UIWindow alloc] initWithWindowScene:scene];
+        }
     }
     if (!win) {
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if (w.isKeyWindow) { win = w; break; }
-        }
+        win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     }
     if (!win) {
-        DLProbe(@"decoy 放弃：找不到可用窗口");
+        DLProbe(@"decoy 放弃：无法创建窗口");
         sShared = nil;
         return;
     }
 
-    UIViewController *root = win.rootViewController;
-    DLProbe(@"decoy 呈现中 root=%@ win=%@", NSStringFromClass([root class]), NSStringFromClass([win class]));
-    [root presentViewController:vc animated:NO completion:^{
-        DLProbe(@"decoy 已呈现完成");
-    }];
+    // 盖在锁屏 / 通知中心 / 控制中心 之上
+    win.windowLevel = UIWindowLevelAlert + 100.0;
+    win.rootViewController = vc;
+
+    // 关键：让这个窗口能收到触摸（hidden 的窗口收不到）
+    win.hidden = NO;
+    [win makeKeyAndVisible];
+
+    DLProbe(@"decoy 已呈现 windowLevel=%.0f scene=%d",
+            win.windowLevel, (int)(win.windowScene != nil));
 }
 
 + (void)dismissDecoy {
     if (!sShared) return;
     DLProbe(@"decoy 退出假空间");
-    DLDecoyController *vc = sShared;
-    [vc dismissViewControllerAnimated:NO completion:^{
-        sShared = nil;
-    }];
+    UIWindow *win = sShared.view.window;
+    sShared = nil;
+
+    // 直接销毁自建窗口（不能只 dismiss 模态 —— 窗口还在就还在屏幕上）
+    if (win) {
+        win.hidden = YES;
+        win.rootViewController = nil;
+        win.windowScene = nil;
+    }
 }
 
 #pragma mark - 生命周期

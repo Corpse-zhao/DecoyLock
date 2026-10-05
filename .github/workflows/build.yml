@@ -44,6 +44,64 @@ jobs:
           gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
           ls -la packages/
 
+      - name: Preflight — 静态自检（拦下「编译过了但钩子是空的」）
+        run: |
+          # 这几条专门拦 v0.1.5 那类错误：Logos 对不存在的类/方法**不报错**，
+          # 所以 CI 全绿、装上也毫无反应。必须在编译前静态拦。
+          FAIL=0
+
+          echo "--- 检查 1：%hook UIResponder 上的输入方法（%orig 会跳 NULL） ---"
+          if grep -nE '^%hook[[:space:]]+UIResponder' Tweak.x; then
+            echo "❌ UIResponder 不实现 -insertText:/-deleteBackward（由 UIKeyInput 的实现方提供）"
+            FAIL=1
+          fi
+
+          echo "--- 检查 2：%hook NSObject（灾难性写法） ---"
+          if grep -nE '^%hook[[:space:]]+NSObject[[:space:]]*$' Tweak.x; then
+            echo "❌ 对 NSObject %hook 会把方法暴露给进程内所有对象（污染 respondsToSelector:）"
+            FAIL=1
+          fi
+
+          echo "--- 检查 3：%hook \$ 非法（Logos 没有「钩所有类」语法） ---"
+          if grep -nE '^%hook[[:space:]]+\$' Tweak.x; then
+            echo "❌ %hook \$ 会去找一个真名叫 '\$' 的类 → objc_getClass 返回 NULL → hook 静默失效。"
+            echo "   正确做法：objc_getClassList 枚举 + MSHookMessageEx（见 Tweak.x Hook 组 C）"
+            FAIL=1
+          fi
+          if grep -nE '^- *\([^)]*\) *\$[a-zA-Z_]' Tweak.x; then
+            echo "❌ 方法名上的 \$ 前缀不是通配符（\$ 只是 Logos 内部符号分隔符，见 logos.pl:14 sigil）"
+            FAIL=1
+          fi
+
+          echo "--- 检查 4：iOS SDK 上不可用的符号（跳过注释行） ---"
+          # ⚠️ 必须排除注释：本项目注释里大量提到 system() / libproc.h 这些坑，
+          #    直接 grep 会误报（实测命中 DLRootListController.m:186 的说明注释）。
+          if grep -vE '^[[:space:]]*(//|\*|/\*)' Tweak.x prefs/*.m \
+               | grep -nE '(^|[^a-zA-Z_.>])system[[:space:]]*\('; then
+            echo "❌ system() 在 iOS SDK 被标记 unavailable，编译必挂"
+            FAIL=1
+          fi
+          if grep -vE '^[[:space:]]*(//|\*|/\*)' Tweak.x prefs/*.m \
+               | grep -nE '#[[:space:]]*(import|include)[[:space:]]*<libproc\.h>'; then
+            echo "❌ libproc.h 不在 iOS SDK 里，需手动 extern 声明 proc_listpids / proc_name"
+            FAIL=1
+          fi
+          if grep -vE '^[[:space:]]*(//|\*|/\*)' Tweak.x prefs/*.m \
+               | grep -nE 'kCALayer(Width|Height)Sizable|arch_get_uname|dispatch_get_current_queue'; then
+            echo "❌ 检测到 iOS SDK 不可用 API"
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应」的包）"
+            exit 1
+          fi
+          echo "✅ 静态自检通过"
+          echo ""
+          echo "--- 本次钩子清单（人工确认用）---"
+          grep -nE '^%hook|^%end|^%ctor|^- *\(|^\+ *\(' Tweak.x
+
       - name: Inspect package contents
         run: |
           python3 - <<'PY'

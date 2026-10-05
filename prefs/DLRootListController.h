@@ -42,4 +42,12 @@
 @property (nonatomic, strong) UITextField *textField;
 @end
 
+// 诊断日志查看器（v0.1.6 新增）—— 纯原生 UITableViewController。
+// ⚠️ 以前用 UIAlertController 的 message 显示日志，内容一长就显示不全、
+//    也没法复制 —— 排查时用户根本没法把日志发出来。改成长列表 + 一键复制。
+@interface DLProbeController : UITableViewController
+@property (nonatomic, strong) NSArray<NSString *> *lines;
+@property (nonatomic, copy)   NSString *plain;   // 供「复制」按钮用的全文
+@end
+
 #endif /* DLRootListController_h */

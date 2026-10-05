@@ -1,26 +1,77 @@
 #import <UIKit/UIKit.h>
 #import <unistd.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dispatch/dispatch.h>
+// MSHookMessageEx —— 用 objc_getClassList 枚举挂钩需要它（见 Hook 组 C）
+// substrate.h 由 Theos 提供（$THEOS/vendor/include），用 __has_include 做容错：
+// 万一某天 theos 分支把 vendor 头挪了位置，退回手动声明，不至于编译挂掉。
+#if __has_include(<substrate.h>)
+#import <substrate.h>
+#elif __has_include(<CydiaSubstrate/CydiaSubstrate.h>)
+#import <CydiaSubstrate/CydiaSubstrate.h>
+#else
+// 手动声明（ElleKit / libhooker 环境同样导出这个符号）
+extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
+#endif
 #import "DLCommon.h"
 #import "DLDecoyController.h"
 
-// ---------------------------------------------------------------------------
-// 伪锁屏 Tweak 入口（注入 SpringBoard）
+// ===========================================================================
+// 伪锁屏 · SpringBoard 侧钩子（v0.1.6 重写）
+// ===========================================================================
 //
-// 核心思路：
-//   1) 无侵入监听锁屏密码框输入的内容
-//   2) 用户按确认/解锁时，先比对是否为「伪密码」
-//   3) 命中伪密码 → 不把密码交给系统（系统继续处于锁定态），只呈现假空间
-//   4) 未命中 → 放行走原生流程
+// v0.1.5 的三个致命错误（本轮全部修掉）：
 //
-// 兼容性设计：iOS 16 的锁屏密码视图是私有类，且不同越狱环境（roothide / 无根）
-// 类名可能有差异。因此采取「候选类名列表 + 运行时探测」的方式，
-// 全部失败时退化为「不干预」（宁可没效果，也不能锁死用户的设备）。
-// ---------------------------------------------------------------------------
+//  ❌ 错误 1：%hook UIResponder / -insertText:
+//     `insertText:` 不是 UIResponder 自己实现的方法，而是 UIKeyInput 协议要求
+//     的实现方方法。对一个不实现它的类做 %hook，Logos 生成的
+//     class_getInstanceMethod 拿到 NULL，`%orig;` 在 dylib 里就是跳 NULL →
+//     SpringBoard 一按键盘就崩（或静默失效）。**必须挂在真正实现它的类上。**
+//
+//  ❌ 错误 2：%hook NSObject / -setText:
+//     灾难性写法。`setText:` 不是 NSObject 的方法，Logos 会把它当成
+//     NSObject 的分类方法加进类里 → 运行时对**整个进程的所有对象**暴露
+//     `-setText:`，任何消息转发/响应性探测（respondsToSelector:）都会被污染。
+//
+//  ❌ 错误 3：钩子目标全是「猜测的类名」
+//     SBLockScreenViewController -passcodeEntryFieldDidSucceed: /
+//     SBLockScreenManager -unlockWithIntent: —— iOS 16 上这两个方法
+//     **都不存在**（前者是 iOS 14 时代的名字，后者签名完全对不上）。
+//     Logos 对不存在的类/方法**不报错**，所以 CI 全绿、装上也毫无反应。
+//
+// 本版策略（不再猜类名，改成「运行时反射 + 通配钩子 + 时间窗」）：
+//
+//  ① 输入捕获：hook **SBUIPasscodeEntryField** 的 setText: / clear /
+//     appendString: 与 UITextField 的 deleteBackward —— 前者是锁屏密码框
+//     的通用基类（iOS 6~17 都在），后者是键盘删除键的事实标准。
+//     另加 **yield 模式**：解锁判定那一瞬间，直接遍历所有 UIWindow 找
+//     「类名含 Passcode 且响应 text 选择器」的视图，读它当前文本。
+//     → 这一路完全不依赖任何钩子命中，是本版的**主路径**。
+//
+//  ② 解锁判定点：用 `-attemptUnlockWithPasscode:`（iOS 6~17 恒存在的
+//     「尝试用密码解锁」点），并以 `$` 前缀让 Logos 对**所有类的同名方法**
+//     生效 —— 不去赌它挂在 SBDeviceLockController 还是 SBLockScreenManager。
+//     → 这是「不用猜类名」的关键技巧，见 SKILL §0.0.12。
+//
+//  ③ 判定窗口：密码框输入后 25 秒内到达的解锁调用才算「本次输入的结果」。
+//     解决「SBLockScreenViewController 生命周期太长，缓冲区被历史输入污染」
+//     的问题，同时避免旧输入串门触发假空间。
+//
+//  ④ 绝不锁死设备：任何一步失败都直接放行原生流程（return %orig）。
+//     伪空间失败最多「没效果」，不可能让用户进不去系统。
+// ===========================================================================
 
 static NSString *const kDLBundleID = @"com.apple.springboard";
 
-// 记录最近一次输入到密码框里的内容
+// 判定窗口：密码框最后一次被写入后，多久内的解锁调用算数
+static const NSTimeInterval kDLWindowSeconds = 25.0;
+
+// 记录密码框当前内容 + 最近一次写入的时间戳
 static NSMutableString *gDLInput = nil;
+static CFAbsoluteTime   gDLInputStamp = 0.0;
+static NSString        *gDLLastSrc = @"";
+
 static NSMutableString *DLInputBuffer(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -39,47 +90,157 @@ static BOOL DLIsSpringBoard(void) {
     return isSB;
 }
 
-// 判定「设置/修改密码界面」不应该被劫持 —— 只在锁屏解锁流程生效
-// 这里用一个宽松但有效的判据：伪密码必须是 4~8 位纯数字，且与输入完全相等
-static BOOL DLMatchesDecoy(NSString *input) {
-    NSString *decoy = DLDecoyPasscode();
-    if (!decoy.length || !input.length) return NO;
-    return [input isEqualToString:decoy];
-}
-
-// 清空缓冲
 static void DLResetInput(void) {
     [DLInputBuffer() setString:@""];
+    gDLInputStamp = 0.0;
 }
 
-// 记录输入
-static void DLAppendInput(NSString *text) {
-    if (!text.length) return;
+// ---------------------------------------------------------------------------
+// 覆盖式写入：密码框给什么，缓冲就是什么。
+// 直接用 setText: 的真实内容，比「自己 append 按键」准确得多
+// （退格、粘贴、自动填充全都自动正确）。
+// ---------------------------------------------------------------------------
+static void DLSetInput(NSString *text, NSString *src) {
+    if (!DLIsSpringBoard()) return;
+
+    NSString *t = text ?: @"";
+    [DLInputBuffer() setString:t];
+    gDLInputStamp = CFAbsoluteTimeGetCurrent();
+    gDLLastSrc = src ?: @"?";
+
+    DLProbe(@"[输入] 源=%@ 内容=%@ len=%lu",
+            gDLLastSrc, t.length ? t : @"(空)", (unsigned long)t.length);
+}
+
+static void DLAppendInput(NSString *text, NSString *src) {
+    if (!DLIsSpringBoard() || !text.length) return;
     [DLInputBuffer() appendString:text];
-    // 保险：缓冲长度上限
     if (DLInputBuffer().length > 64) {
-        NSRange r = NSMakeRange(DLInputBuffer().length - 32, 32);
-        [DLInputBuffer() setString:[DLInputBuffer() substringWithRange:r]];
+        [DLInputBuffer() setString:
+            [DLInputBuffer() substringFromIndex:DLInputBuffer().length - 32]];
     }
-    DLProbe(@"passcode 输入缓冲 len=%lu", (unsigned long)DLInputBuffer().length);
+    gDLInputStamp = CFAbsoluteTimeGetCurrent();
+    gDLLastSrc = src ?: @"?";
+    DLProbe(@"[输入] 源=%@ 追加=%@ 结果 len=%lu",
+            gDLLastSrc, text, (unsigned long)DLInputBuffer().length);
 }
 
 // ---------------------------------------------------------------------------
-// 拦截入口：在「密码正确」的判定点前插入。
-// 若输入等于伪密码 → 呈现假空间并吞掉本次解锁（返回，不调用 %orig 的后续解锁）
+// yield 兜底：直接去视图树里把密码框的文本抠出来。
+// 完全不依赖任何钩子是否命中 —— 这是本版的主路径。
 // ---------------------------------------------------------------------------
 
-static BOOL DLShouldHijackUnlock(void) {
+@interface UIView (DLTextSniff)
+@end
+@implementation UIView (DLTextSniff)
+
+static void DLScanPasscodeText(UIView *v, NSString **out, int depth) {
+    if (!v || *out || depth > 14) return;
+
+    NSString *cls = NSStringFromClass([v class]);
+    BOOL looksPasscode = [cls containsString:@"Passcode"] ||
+                         [cls containsString:@"Pearl"] ||
+                         [cls containsString:@"PasscodeEntry"];
+    // 排除设置/添加密码那种「旧密码+新密码」的界面
+    BOOL looksSetup = [cls containsString:@"ChangePasscode"] ||
+                      [cls containsString:@"PasscodeSet"] ||
+                      [cls containsString:@"PasscodeCreation"];
+
+    if (looksPasscode && !looksSetup) {
+        SEL sel = @selector(text);
+        if ([v respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id t = [v performSelector:sel];
+#pragma clang diagnostic pop
+            if ([t isKindOfClass:[NSString class]] && [(NSString *)t length]) {
+                *out = [(NSString *)t copy];
+                return;
+            }
+        }
+    }
+    for (UIView *sub in v.subviews) {
+        DLScanPasscodeText(sub, out, depth + 1);
+        if (*out) return;
+    }
+}
+
+@end
+
+// 把当前锁屏密码框的文本抠出来（找不到返回 nil）
+static NSString *DLSniffPasscodeFromWindows(void) {
+    if (!DLIsSpringBoard()) return nil;
+
+    NSMutableArray *wins = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]]) {
+                [wins addObjectsFromArray:((UIWindowScene *)sc).windows];
+            }
+        }
+    }
+    if (!wins.count) [wins addObjectsFromArray:UIApplication.sharedApplication.windows];
+
+    for (UIWindow *w in wins) {
+        NSString *found = nil;
+        DLScanPasscodeText(w, &found, 0);
+        if (found.length) return found;
+    }
+    return nil;
+}
+
+// ---------------------------------------------------------------------------
+// 判定：是否应当劫持这次解锁
+// ---------------------------------------------------------------------------
+static BOOL DLShouldHijackUnlock(NSString *from) {
     if (!DLIsSpringBoard()) return NO;
-    if (!DLEnabled()) return NO;
+    if (!DLEnabled()) {
+        DLProbe(@"[判定] 来自 %@ 但插件未启用 → 放行", from);
+        return NO;
+    }
 
     NSString *decoy = DLDecoyPasscode();
-    if (!decoy.length) return NO;
+    if (!decoy.length) {
+        DLProbe(@"[判定] 来自 %@ 但未配置伪密码 → 放行", from);
+        return NO;
+    }
 
+    // ---- 第一步：先看钩子缓冲 ----
     NSString *input = [DLInputBuffer() copy];
-    if (!DLMatchesDecoy(input)) return NO;
+    NSTimeInterval age = gDLInputStamp > 0
+        ? CFAbsoluteTimeGetCurrent() - gDLInputStamp : 1e9;
 
-    DLProbe(@"*** 命中伪密码（len=%lu），劫持解锁并呈现假空间", (unsigned long)input.length);
+    DLProbe(@"[判定] 来自 %@ 缓冲=%@(len=%lu, 源=%@, %.1fs前) 期望=%@",
+            from, input.length ? input : @"(空)",
+            (unsigned long)input.length, gDLLastSrc, age, decoy);
+
+    // ---- 第二步：钩子没抓到 → 直接抠视图树（yield 主路径）----
+    if (!input.length || age > kDLWindowSeconds) {
+        NSString *sniffed = DLSniffPasscodeFromWindows();
+        DLProbe(@"[判定] yield 抠取结果=%@", sniffed.length ? sniffed : @"(失败)");
+        if (sniffed.length) {
+            input = sniffed;
+            age = 0.0;
+        }
+    }
+
+    if (!input.length) {
+        DLProbe(@"[判定] 无输入可用 → 放行（不干预）");
+        return NO;
+    }
+
+    if (age > kDLWindowSeconds) {
+        DLProbe(@"[判定] 输入已过期（%.1fs > %.0fs）→ 放行", age, kDLWindowSeconds);
+        return NO;
+    }
+
+    if (![input isEqualToString:decoy]) {
+        DLProbe(@"[判定] 不匹配伪密码 → 放行");
+        return NO;
+    }
+
+    // ---- 命中！----
+    DLProbe(@"*** 命中伪密码（来源 %@）→ 劫持解锁，呈现假空间", from);
     DLResetInput();
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -88,142 +249,286 @@ static BOOL DLShouldHijackUnlock(void) {
     return YES;
 }
 
-// ---------------------------------------------------------------------------
-// Hook 1：通用密码框输入监听
-// iOS 的密码输入视图（SBUIPasscodeEntryField / SBPearlPasscodeEntryField 等）
-// 都会有 -setText: / -insertText: 之类的入口。用宽泛的候选列表挂钩。
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Hook 组 A：密码输入框（真正实现 setText: 的类）
+// ===========================================================================
 
 @interface SBUIPasscodeEntryField : UIView
 @end
 
-@interface SBUIPasscodeNumberPadButton : UIView
-@end
-
-// --- 通用：任何 UIKeyInput 的 insertText: ---
-%hook UIResponder
-- (void)insertText:(NSString *)text {
-    %orig;
-    if (DLIsSpringBoard() && DLEnabled()) {
-        // 只在密码相关视图里记录：父链上含 Passcode 关键字
-        UIView *v = (UIView *)self;
-        BOOL inPasscode = NO;
-        NSUInteger guard = 0;
-        while (v && guard++ < 12) {
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls containsString:@"Passcode"] || [cls containsString:@"Pearl"]) {
-                inPasscode = YES;
-                break;
-            }
-            v = v.superview;
-        }
-        if (inPasscode) DLAppendInput(text);
-    }
-}
-%end
-
-// --- 通用：密码输入框 setText: 兜底（程序化设置时） ---
-%hook NSObject
+%hook SBUIPasscodeEntryField
 - (void)setText:(NSString *)text {
     %orig;
-    if (!DLIsSpringBoard() || !DLEnabled()) return;
-    NSString *cls = NSStringFromClass([self class]);
-    if ([cls containsString:@"Passcode"] || [cls containsString:@"Pearl"]) {
-        [DLInputBuffer() setString:text ?: @""];
-        DLProbe(@"passcode setText 同步缓冲 %@ len=%lu",
-                cls, (unsigned long)DLInputBuffer().length);
+    DLSetInput(text, @"entry.set");
+}
+- (void)appendString:(NSString *)s {
+    %orig;
+    DLAppendInput(s, @"entry.append");
+}
+- (void)clear {
+    %orig;
+    DLResetInput();
+    DLProbe(@"[输入] 源=entry.clear 已清空");
+}
+- (void)deleteBackward {
+    %orig;
+    if (DLInputBuffer().length) {
+        [DLInputBuffer() deleteCharactersInRange:
+            NSMakeRange(DLInputBuffer().length - 1, 1)];
+        gDLInputStamp = CFAbsoluteTimeGetCurrent();
+        gDLLastSrc = @"entry.del";
     }
 }
 %end
 
-// ---------------------------------------------------------------------------
-// Hook 2：解锁判定点
-// SBLockScreenViewController 家族上负责「密码验证结果」的方法。
-// 这里采用「结果回调」方式：系统验完密码、认为成功时，我们抢在真正解锁前
-// 判断是不是伪密码。
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Hook 组 B：键盘删除键（UITextField 是密码框内部真正的编辑视图）
+// ===========================================================================
 
-@interface SBLockScreenViewController : UIViewController
-@end
-
-@interface SBUIPasscodeLockViewWithKeyboard : UIView
-@end
-
-%hook SBLockScreenViewController
-// 密码验证成功回调（多个候选方法名，iOS 版本差异）
-- (void)passcodeEntryFieldDidSucceed:(id)field {
-    DLProbe(@"hook passcodeEntryFieldDidSucceed, 缓冲=%@", [DLInputBuffer() copy]);
-    if (DLShouldHijackUnlock()) return;      // 吞掉，不解锁
-    DLResetInput();
+%hook UITextField
+- (void)deleteBackward {
     %orig;
-}
-
-- (void)notePasscodeEntryFieldDidSucceed:(id)field {
-    DLProbe(@"hook notePasscodeEntryFieldDidSucceed, 缓冲=%@", [DLInputBuffer() copy]);
-    if (DLShouldHijackUnlock()) return;
-    DLResetInput();
-    %orig;
+    if (!DLIsSpringBoard()) return;
+    NSString *cls = NSStringFromClass([self class]);
+    BOOL related = [cls containsString:@"Passcode"] ||
+                   [cls containsString:@"Pearl"];
+    if (!related) {
+        // 也可能是被 SBUIPasscodeEntryField 持有的普通 UITextField
+        UIView *p = self.superview;
+        int guard = 0;
+        while (p && guard++ < 6) {
+            NSString *pc = NSStringFromClass([p class]);
+            if ([pc containsString:@"Passcode"] || [pc containsString:@"Pearl"]) {
+                related = YES;
+                break;
+            }
+            p = p.superview;
+        }
+    }
+    if (related && DLInputBuffer().length) {
+        [DLInputBuffer() deleteCharactersInRange:
+            NSMakeRange(DLInputBuffer().length - 1, 1)];
+        gDLInputStamp = CFAbsoluteTimeGetCurrent();
+        gDLLastSrc = @"tf.del";
+        DLProbe(@"[输入] 源=tf.del 退格后 len=%lu", (unsigned long)DLInputBuffer().length);
+    }
 }
 %end
 
+// ===========================================================================
+// Hook 组 C：解锁判定点 —— 用 objc_getClassList 全类枚举，不赌类名
+//
+// ⭐ 为什么不能写 `%hook $` / `- (BOOL)$foo:`（已从 Logos 源码实锤，别被网上
+//    「$ 是通配符」的说法骗了）：
+//
+//    Logos 里 `$` 的**唯一**用途是「符号名分隔符」——
+//    logos.pl:14  `sub sigil { return "_logos_".join("\$", @_); }`
+//    生成的符号长这样：`_logos_method$_ungrouped$ClassName$selector`
+//    （见官方 README 的 Tweak.x.m 示例输出）。
+//
+//    `_new_selector`（Method.pm:107）里那个 join("\$", ...)
+//    是用来拼**内部符号名**的，不是让 selector 变成通配。
+//    `%hook $Foo` 最终会生成 `MSHookMessageEx(objc_getClass("$Foo"), ...)`
+//    —— 去运行时找**名字真的叫 "$Foo" 的类**，找不到就是 NULL，
+//    整个 hook 静默失效（甚至崩）。Logos 源码里也没有任何 wildcard 逻辑。
+//
+//    ✅ 正确做法：自己用 objc_getClassList 遍历进程内所有类，
+//       逐个检查是否**自身实现**了 `-attemptUnlockWithPasscode:`，
+//       命中就用 MSHookMessageEx 挂上。这正是「不赌类名」的正解。
+//
+//    为什么必须这样做：
+//      iOS 16.6 上该方法挂在 SBDeviceLockController（DeviceLock.framework）。
+//      Apple 随时可能挪类/换框架，硬编码类名一挪就失效、且**静默失效**。
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
-// Hook 3：更底层 —— 密码验证器。无论上层 UI 类名怎么变，验证器通常稳定。
-// SBUIPasscodeLockView 系列最终都会把输入交给 SBLockScreenManager / 
-// SBPasscodeController 之类。这里 hook 一个更通用的点：
-// 「密码验证通过后调用」的方法群。全部走同一道 DLShouldHijackUnlock 闸门。
+// 通用：把「所有自身实现了 selector 的类」挂钩到一个 C 函数上
 // ---------------------------------------------------------------------------
+
+// 被 hook 到的类们（用于日志）
+static NSMutableArray *gDLHookedClasses = nil;
+
+// 原始实现指针（按类分别保存，%orig 等价物）
+static NSMutableDictionary<NSString *, NSValue *> *gDLOrigIMPs = nil;
+
+// 我们的替换实现签名：BOOL (*)(id, SEL, id)
+typedef BOOL (*DLAttemptIMP)(id, SEL, id);
+
+// 替换实现
+static BOOL DLAttemptUnlockReplacement(id self, SEL _cmd, id passcode) {
+    if (DLShouldHijackUnlock(@"runtime.attemptUnlockWithPasscode")) {
+        DLProbe(@"[放行控制] %@ 的解锁调用被吞掉（返回 NO）",
+                NSStringFromClass([self class]));
+        return NO;      // 告诉系统「解锁失败」，密码框留在锁屏
+    }
+
+    // 放行：找到该类自己的原始 IMP
+    NSString *key = NSStringFromClass([self class]);
+    NSValue *boxed = gDLOrigIMPs[key];
+    if (!boxed) {
+        // 兜底：往继承链上方找
+        Class c = class_getSuperclass([self class]);
+        while (c && !boxed) {
+            boxed = gDLOrigIMPs[NSStringFromClass(c)];
+            c = class_getSuperclass(c);
+        }
+    }
+    if (boxed) {
+        DLAttemptIMP orig = (DLAttemptIMP)[boxed pointerValue];
+        return orig(self, _cmd, passcode);
+    }
+    // 找不到原始实现 → 保守返回 NO（宁可不解锁，也不能崩）
+    DLProbe(@"[放行控制] 警告：%@ 找不到原始 IMP，保守返回 NO", key);
+    return NO;
+}
+
+// 遍历所有类，给「自身实现 attemptUnlockWithPasscode:」的类挂钩
+//
+// ⚠️ 安全边界：本 dylib 只注入 com.apple.springboard（见 DecoyLock.plist 的
+//    filter），所以在 SpringBoard 进程里枚举到的类几乎都是系统类。但仍要
+//    排掉两类：
+//      ① 类名以 _ 开头的运行时内部类（NSZombie 之类）
+//      ② 不在系统镜像里的类（第三方框架被 SpringBoard 加载的情形，极少，
+//         但一旦命中就把别人的密码框搞坏了）
+//    判据：`dladdr(class_getImageName(c))` 的路径必须落在 /System/Library
+//    或 /usr/lib（iOS 系统镜像），其余一律跳过。
+static void DLHookAllAttemptUnlock(void) {
+    gDLOrigIMPs = [NSMutableDictionary dictionary];
+    gDLHookedClasses = [NSMutableArray array];
+
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) {
+        DLProbe(@"[挂钩] objc_copyClassList 失败");
+        return;
+    }
+
+    SEL target = NSSelectorFromString(@"attemptUnlockWithPasscode:");
+    unsigned int skipped = 0;
+
+    for (unsigned int i = 0; i < count; i++) {
+        Class c = classes[i];
+        if (!c) continue;
+
+        NSString *cname = NSStringFromClass(c);
+        if (!cname.length || [cname hasPrefix:@"_"]) continue;
+
+        // ① 只认系统镜像里的类 —— 绝不碰第三方框架
+        const char *image = class_getImageName(c);
+        if (!image) continue;
+        NSString *imgPath = [NSString stringWithUTF8String:image];
+        BOOL isSystem = [imgPath hasPrefix:@"/System/Library/"] ||
+                        [imgPath hasPrefix:@"/usr/lib/"];
+        if (!isSystem) { skipped++; continue; }
+
+        // ② 只看「自身实现」—— class_getInstanceMethod 会沿继承链找，
+        //    会导致父类也被重复误挂。
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        BOOL owns = NO;
+        if (ms) {
+            for (unsigned int j = 0; j < mc; j++) {
+                if (sel_isEqual(method_getName(ms[j]), target)) { owns = YES; break; }
+            }
+            free(ms);
+        }
+        if (!owns) continue;
+
+        IMP old = NULL;
+        MSHookMessageEx(c, target, (IMP)&DLAttemptUnlockReplacement, &old);
+        if (old) {
+            gDLOrigIMPs[cname] = [NSValue valueWithPointer:(void *)old];
+        }
+        [gDLHookedClasses addObject:cname];
+        DLProbe(@"[挂钩] ✅ 已挂 %@ 的 attemptUnlockWithPasscode:（orig=%p, 镜像=%@）",
+                cname, (void *)old, [imgPath lastPathComponent]);
+    }
+
+    free(classes);
+
+    if (!gDLHookedClasses.count) {
+        DLProbe(@"[挂钩] ❌ 系统镜像里没有任何类自身实现 attemptUnlockWithPasscode:"
+                @"（跳过非系统类 %u 个）—— 这个判定点在本系统不可用，"
+                @"将只依赖密码框输入捕获 + yield 兜底", skipped);
+    } else {
+        DLProbe(@"[挂钩] 共挂上 %lu 个类（跳过非系统类 %u 个）: %@",
+                (unsigned long)gDLHookedClasses.count, skipped,
+                [gDLHookedClasses componentsJoinedByString:@", "]);
+    }
+}
+
+// ===========================================================================
+// Hook 组 D：锁屏生命周期 —— 锁屏出现/消失时清空缓冲，避免串门
+// ===========================================================================
 
 @interface SBLockScreenManager : NSObject
 @end
 
 %hook SBLockScreenManager
-- (void)unlockWithIntent:(int)intent {
-    NSString *cls __attribute__((unused)) = NSStringFromClass([self class]);
-    DLProbe(@"hook unlockWithIntent 前, 缓冲=%@", [DLInputBuffer() copy]);
-    if (DLShouldHijackUnlock()) return;
+- (void)lockUIFromSource:(int)source withOptions:(id)options {
+    DLResetInput();
+    DLProbe(@"锁屏出现 → 清空输入缓冲");
+    %orig;
+}
+- (void)noteLockScreenUIDidDisappear {
+    // 进真桌面时清掉一切痕迹（避免下次锁屏被上次输入污染）
     DLResetInput();
     %orig;
 }
 %end
 
-// ---------------------------------------------------------------------------
-// Hook 4：锁屏消失/重现时清空输入缓冲，避免跨会话污染
-// ---------------------------------------------------------------------------
-
-%hook SBUIPasscodeEntryField
-- (void)setText:(NSString *)text {
-    %orig;
-    if (!DLEnabled()) return;
-    [DLInputBuffer() setString:text ?: @""];
-}
-%end
-
-%hook SBUIPasscodeEntryField
-- (void)clear {
-    %orig;
-    DLResetInput();
-}
-%end
-
-// ---------------------------------------------------------------------------
-// 启动日志 + 心跳
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// 启动
+// ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动 ==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.6）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
-    DLProbe(@"已启用=%d 伪密码已配置=%d", DLEnabled(), DLDecoyPasscode().length > 0);
+    DLProbe(@"已启用=%d 伪密码已配置=%d",
+            DLEnabled(), DLDecoyPasscode().length > 0);
     DLProbe(@"共享目录=%@", DLSharedDir());
     DLProbe(@"配置存在=%d",
             [[NSFileManager defaultManager] fileExistsAtPath:DLConfigPath()]);
     DLProbe(@"伪 App 数量=%lu", (unsigned long)DLDecoyApps().count);
+
+    // 自检：关键私有类是否存在、有没有实现我们要的方法
+    // 用户只要把诊断日志发回来，就能一眼看出钩子挂空在哪
+    NSArray *probeClasses = @[
+        @"SBUIPasscodeEntryField", @"SBUIPasscodeLockViewWithKeypad",
+        @"SBUIPasscodeEntryFieldAccessibility", @"SBLockScreenManager",
+        @"SBDeviceLockController", @"SBLockScreenViewController",
+        @"SBPearlPasscodeEntryField", @"SBPasscodeEntryField",
+    ];
+    for (NSString *cn in probeClasses) {
+        Class c = NSClassFromString(cn);
+        if (!c) {
+            DLProbe(@"[自检] 类 %@ : ❌ 不存在", cn);
+            continue;
+        }
+        BOOL hasSetText = class_getInstanceMethod(c, @selector(setText:)) != NULL;
+        Method am = class_getInstanceMethod(c,
+            NSSelectorFromString(@"attemptUnlockWithPasscode:"));
+        DLProbe(@"[自检] 类 %@ : ✅ 存在  setText:=%d  attempt=%d",
+                cn, hasSetText, am != NULL);
+    }
 }
 
 %ctor {
     @autoreleasepool {
-        // 只有 SpringBoard 需要这个功能
         if (DLIsSpringBoard()) {
             DLDumpEnvironment();
+
+            // ⭐ 关键：枚举所有类，挂钩 attemptUnlockWithPasscode:
+            //    必须在 springboard 起来之后、用户解锁之前完成。
+            //    构造器阶段 SpringBoard 的锁屏类可能还没注册，
+            //    所以延后 3 秒再挂一次（挂不上就说明系统不用这个方法，
+            //    此时依赖密码框捕获 + yield 兜底，不会锁死设备）。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                DLHookAllAttemptUnlock();
+                DLProbe(@"[自检] 3 秒后复读配置：已启用=%d 伪密码已配置=%d",
+                        DLEnabled(), DLDecoyPasscode().length > 0);
+            });
         }
     }
 }
