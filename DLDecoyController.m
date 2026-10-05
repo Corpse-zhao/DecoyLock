@@ -237,9 +237,10 @@ static DLDecoyController *sShared = nil;
     gl.frame = wp.bounds;
     [self.view addSubview:wp];
 
-    // 壁纸随屏幕尺寸变化时重设渐变 frame
-    wp.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    g.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    // ⚠️ kCALayerWidthSizable / kCALayerHeightSizable 在 iOS SDK 里被标记
+    //    unavailable（是 macOS 的 API），用它们直接编译失败。
+    //    UIView 的 autoresizingMask 已能保证 wrap 跟随父视图，渐变层在
+    //    viewDidLayoutSubviews / viewLayoutMarginsDidChange 里随 bounds 重设 frame。
 }
 
 #pragma mark - 状态区（时间 / 日期 / 机型名）
@@ -250,6 +251,11 @@ static DLDecoyController *sShared = nil;
 
     NSString *title = DLDecoyTitle();
     NSString *sub = DLDecoySubtitle();
+
+    // 副标题非空时并到标题行（保持行数固定，避免复杂布局）
+    if (sub.length) {
+        title = [NSString stringWithFormat:@"%@ · %@", title, sub];
+    }
 
     self.titleLabel = [[UILabel alloc] init];
     self.titleLabel.text = title;
@@ -402,6 +408,27 @@ static DLDecoyController *sShared = nil;
 
 - (void)viewLayoutMarginsDidChange {
     [super viewLayoutMarginsDidChange];
+    [self relayoutForBounds];
+
+    // 渐变壁纸跟着新尺寸重设（CALayer 不参与 Auto Layout，必须手动同步）
+    for (CALayer *l in self.wallpaperView.layer.sublayers) {
+        if ([l isKindOfClass:[CAGradientLayer class]]) {
+            l.frame = self.wallpaperView.bounds;
+        }
+    }
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self relayoutForBounds];
+    for (CALayer *l in self.wallpaperView.layer.sublayers) {
+        if ([l isKindOfClass:[CAGradientLayer class]]) {
+            l.frame = self.wallpaperView.bounds;
+        }
+    }
+}
+
+- (void)relayoutForBounds {
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     CGFloat dockH = 92.0;
