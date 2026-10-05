@@ -47,7 +47,7 @@
         {
             "cell": "PSLinkCell",
             "label": "选择要显示的 App",
-            "detail": "DLAppPickerController"
+            "action": "pushAppPicker:"
         },
         {
             "cell": "PSGroupCell",
@@ -72,7 +72,7 @@
         {
             "cell": "PSGroupCell",
             "label": "",
-            "footerText": "伪锁屏 v0.1.4 · 作者 板栗仁"
+            "footerText": "伪锁屏 v0.1.5 · 作者 板栗仁"
         }
     ]
 }

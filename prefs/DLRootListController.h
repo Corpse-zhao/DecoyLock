@@ -34,8 +34,8 @@
 @interface DLAppPickerController : UITableViewController
 @end
 
-// 文本编辑页（替代不稳定的 PSTextFieldSpecifier）
-@interface DLTextEditController : UITableViewController
+// 文本编辑页（替代不稳定的 PSTextFieldSpecifier）—— 纯 UIViewController + autolayout
+@interface DLTextEditController : UIViewController
 @property (nonatomic, copy)   NSString *cfgKey;
 @property (nonatomic, copy)   NSString *cfgTitle;
 @property (nonatomic, assign) BOOL numericOnly;

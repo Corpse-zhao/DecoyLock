@@ -13,6 +13,9 @@
 #import <notify.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <dlfcn.h>
+#import <unistd.h>
+#import <stdlib.h>
 
 // 配置域
 static NSString *const kDLDomain = @"com.blr.decoylock";
@@ -149,13 +152,45 @@ static NSArray *DLDefaultSelection(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [ac addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive
                                         handler:^(UIAlertAction *a) {
-        pid_t pid = 0;
-        int status = 0;
-        const char *args[] = {"killall", "-9", "SpringBoard", NULL};
-        posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, (char *const *)args, NULL);
-        waitpid(pid, &status, 0);
+            DLDoRespring();
     }]];
     [self presentViewController:ac animated:YES completion:nil];
+}
+
+// killall 的真实路径：rootful 在 /usr/bin；roothide 在随机 jbroot 里。
+// ⚠️ jbroot 路径不能写死 —— 用 dladdr 拿到自身 bundle 二进制的物理路径，
+//    截取 <jbroot> 前缀（/<...>/​.jbroot-XXXX/Library/PreferenceBundles/...）
+static NSString *DLKillallPath(void) {
+    if (access("/usr/bin/killall", X_OK) == 0) return @"/usr/bin/killall";
+
+    Dl_info info;
+    if (dladdr((void *)&DLKillallPath, &info) && info.dli_fname) {
+        NSString *self_ = [NSString stringWithUTF8String:info.dli_fname];
+        NSRange r = [self_ rangeOfString:@"/Library/PreferenceBundles/"];
+        if (r.location != NSNotFound) {
+            NSString *jbroot = [self_ substringToIndex:r.location];
+            NSString *cand = [jbroot stringByAppendingPathComponent:@"usr/bin/killall"];
+            if (access([cand fileSystemRepresentation], X_OK) == 0) return cand;
+        }
+    }
+    return nil;
+}
+
+static void DLDoRespring(void) {
+    pid_t pid = 0;
+    int status = 0;
+    int rc = -1;
+    NSString *kp = DLKillallPath();
+    if (kp) {
+        const char *args[] = {"killall", "-9", "SpringBoard", NULL};
+        rc = posix_spawn(&pid, [kp fileSystemRepresentation], NULL, NULL,
+                         (char *const *)args, NULL);
+        if (rc == 0) waitpid(pid, &status, 0);
+    }
+    if (rc != 0) {
+        // 兜底：走 shell 的 PATH 搜索（roothide 注入的 PATH 一般含 jbroot/usr/bin）
+        system("killall -9 SpringBoard 2>/dev/null");
+    }
 }
 
 - (void)showProbe {
@@ -215,6 +250,15 @@ static NSArray *DLDefaultSelection(void) {
     [self.navigationController pushViewController:vc animated:YES];
 }
 
+// ⚠️ App 选择器也走同一条已验证的 push 通道 —— 绝不用 plist 的 detail 键：
+//    Preferences 框架对 detail 控制器有 PSListController 体系假设，
+//    给纯原生 UITableViewController 会在框架内部实例化时崩溃（用户实测闪退）。
+- (void)pushAppPicker:(PSSpecifier *)spec {
+    DLAppPickerController *vc = [[DLAppPickerController alloc]
+        initWithStyle:UITableViewStyleInsetGrouped];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
 @end
 
 #pragma mark - 纯原生 App 选择器（不碰 PSSpecifier）
@@ -223,9 +267,7 @@ static NSArray *DLDefaultSelection(void) {
 
 - (instancetype)init {
     return [super initWithStyle:UITableViewStyleInsetGrouped];
-}
-
-- (void)viewDidLoad {
+}- (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"假空间 App";
 
@@ -294,47 +336,69 @@ static NSArray *DLDefaultSelection(void) {
 @end
 
 #pragma mark - 纯原生文本编辑页（替代 PSTextFieldSpecifier）
+// ⚠️ 布局用 NSLayoutConstraint 锚定 safeArea —— 绝不在 viewDidLoad 里用
+//    self.view.bounds 算固定坐标（那时布局未完成，会跑出屏幕，用户实测「大小不对」）
 
 @implementation DLTextEditController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = self.cfgTitle ?: @"编辑";
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemSave
                                                       target:self
                                                       action:@selector(save)];
 
-    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(20, 0,
-                            self.view.bounds.size.width - 40, 44)];
+    id hint = self.numericOnly ? @"4~8 位纯数字" : nil;
+
+    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectZero];
     tf.borderStyle = UITextBorderStyleRoundedRect;
     tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
     tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    tf.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     if (self.numericOnly) {
         tf.keyboardType = UIKeyboardTypeNumberPad;
         tf.secureTextEntry = YES;
     }
     tf.text = DLPrefsLoad()[self.cfgKey] ?: @"";
-    tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    tf.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     self.textField = tf;
+    [self.view addSubview:tf];
 
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
-                            self.view.bounds.size.width, 60)];
-    header.backgroundColor = [UIColor clearColor];
-    tf.center = CGPointMake(header.bounds.size.width / 2.0, 30);
-    [header addSubview:tf];
+    UILabel *lb = [[UILabel alloc] initWithFrame:CGRectZero];
+    lb.text = hint;
+    lb.font = [UIFont systemFontOfSize:13.0];
+    lb.textColor = [UIColor secondaryLabelColor];
+    lb.hidden = (hint == nil);
+    [self.view addSubview:lb];
 
-    UITableView *tv = (UITableView *)self.view;
-    tv.tableHeaderView = header;
+    tf.translatesAutoresizingMaskIntoConstraints = NO;
+    lb.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [tf.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:20],
+        [tf.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [tf.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [tf.heightAnchor constraintEqualToConstant:44],
+        [lb.topAnchor constraintEqualToAnchor:tf.bottomAnchor constant:8],
+        [lb.leadingAnchor constraintEqualToAnchor:tf.leadingAnchor],
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(viewTapped)];
+    [self.view addGestureRecognizer:tap];
+
     [tf becomeFirstResponder];
+}
+
+- (void)viewTapped {
+    [self.view endEditing:YES];
 }
 
 - (void)save {
     NSString *v = self.textField.text ?: @"";
     if (self.numericOnly) {
-        // 只保留数字
         NSMutableString *digits = [NSMutableString string];
         for (NSUInteger i = 0; i < v.length; i++) {
             unichar c = [v characterAtIndex:i];
@@ -351,7 +415,5 @@ static NSArray *DLDefaultSelection(void) {
     }
     [self.navigationController popViewControllerAnimated:YES];
 }
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 0; }
 
 @end
