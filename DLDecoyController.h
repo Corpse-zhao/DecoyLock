@@ -17,6 +17,23 @@
 /// 主动退出假空间（回到真锁屏）
 + (void)dismissDecoy;
 
+/// ⭐ v0.1.14：伪造锁屏界面的「密码错误」反馈 —— 闪红 + 抖动 + 清空输入。
+/// 用户输入了伪密码但用户自己没配「伪密码位数」时（无法判定该不该进假空间），
+/// 用它把界面上看起来像「密码错了」，避免暴露插件。
++ (void)showFakeWrongFeedback;
+
+#pragma mark - ⭐ v0.1.14 主动取词：由 Tweak 直接询问「这串输入该怎么处理」
+
+typedef NS_ENUM(NSInteger, DLPasscodeVerdict) {
+    DLPasscodeVerdictNative = 0,   // 交给系统原生流程（放行）
+    DLPasscodeVerdictDecoy,        // 命中伪密码 → 进假空间
+};
+
+/// 核心决策：拿着用户刚敲完的一串数字，判断该不该进假空间。
+/// @param digits 用户已输入的完整数字串（来自密码框钩子）
+/// @return 该走哪条路
++ (DLPasscodeVerdict)handleCapturedPasscode:(NSString *)digits;
+
 @end
 
 #endif /* DLDecoyController_h */

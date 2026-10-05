@@ -131,6 +131,40 @@ jobs:
             FAIL=1
           fi
 
+          echo "--- 检查 8：⭐ v0.1.14 主动取词必须真的接上（防「等着系统回调」反模式复活） ---"
+          # 本项目 v0.1.0~v0.1.13 共 13 个版本都栽在同一个坑里：
+          #   「输入完 → 等系统调用某个带密码的方法 → 在那里比对」
+          # v0.1.13 日志实锤：系统在密码错误路径上**不外露任何携带密码的调用**
+          #   （unlockWithRequest: 被调用 0 次），这条路永远走不通。
+          # 唯一可行的是【主动取词】：输入够位数时插件自己去比对。
+          # 下面这几条保证它不会被后来的改动悄悄破坏。
+          if ! grep -qE 'DLTriggerActiveVerdict' Tweak.x; then
+            echo "❌ 没有找到 DLTriggerActiveVerdict ——「主动取词」入口消失了。"
+            echo "   这个插件必须*主动*判定（不等系统回调），否则又回到 13 版都没解决的死路上。"
+            FAIL=1
+          fi
+          if grep -qE 'DLTriggerActiveVerdict' Tweak.x; then
+            if ! grep -qE 'DLTriggerActiveVerdict\(gDLLastSrc\)' Tweak.x; then
+              echo "❌ DLTriggerActiveVerdict 定义了但没在输入钩子里调用 → 主动判定永远不触发"
+              FAIL=1
+            fi
+          fi
+          if ! grep -qE 'handleCapturedPasscode' Tweak.x prefs/../DLDecoyController.m 2>/dev/null && \
+             ! grep -qE 'handleCapturedPasscode' DLDecoyController.m; then
+            echo "❌ DLDecoyController 没实现 handleCapturedPasscode:（主动判定的核心比对函数）"
+            FAIL=1
+          fi
+          if ! grep -qE 'DLTriggerActiveVerdict' Tweak.x; then
+            : # 上面已报
+          else
+            # 输入钩子里必须真的调到（Hook 组 A 的 appendString:/setText:）
+            if ! grep -A 12 'DLAppendInput(NSString \*text' Tweak.x | grep -qE 'DLTriggerActiveVerdict'; then
+              echo "❌ DLAppendInput 函数体里没调 DLTriggerActiveVerdict → 主动判定接不上输入"
+              FAIL=1
+            fi
+            echo "✅ 主动取词链路完整（输入钩子 → DLTriggerActiveVerdict → handleCapturedPasscode:）"
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

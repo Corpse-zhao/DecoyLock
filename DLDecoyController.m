@@ -1,5 +1,6 @@
 #import "DLDecoyController.h"
 #import "DLCommon.h"
+#import <AudioToolbox/AudioToolbox.h>
 
 // ---------------------------------------------------------------------------
 // 假空间界面
@@ -131,6 +132,95 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 @implementation DLDecoyController
 
 static DLDecoyController *sShared = nil;
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.14 主动取词 —— 核心决策
+//
+// 为什么改成这一套（这是本项目第 14 版，前 13 版全在「等系统告诉我结果」）：
+//
+//   v0.1.13 日志实锤：用户敲完 6 位密码后，系统**没有**走
+//     - coverSheetViewController:unlockWithRequest:completion:   （0 次）
+//     - coverSheetPresentationManager:unlockWithRequest:completion:（0 次）
+//   而是直接：
+//     23:00:29.812  [侦查] SBUIPasscodeLockViewSimpleFixedDigitKeypad -resetForFailedPasscode
+//     23:00:29.814  [失败回调] ★ resetForFailedPasscode 被调用 → 系统判定密码错误
+//   → 也就是说，密码错误这条路径上，系统**根本不外露任何携带密码的调用**。
+//     想靠「挂钩系统回调」拿到密码，这条路线已被证明走不通。
+//
+// 于是本版彻底换思路：**不问了，自己数**。
+//
+//   ① 密码框钩子（Hook 组 A）已经能 100% 拿到用户按键（v0.1.9 起就验证过：
+//      `[输入] 源=entry.append 追加=6 结果 len=4`）
+//   ② 插件自己记着「伪密码是几位」，一旦输入长度够了，就**主动**做比对
+//   ③ 命中 → 自己把假空间盖上去（顺带把系统随后弹的密码错误界面也盖住）
+//      不命中 → 什么都不做，交给系统原生流程（用户看到正常的「密码错误 + 锁定」）
+//
+//  安全性：不吞任何系统调用、不改写系统返回值、不等任何系统回调。
+//          判断错了最多是「该进假空间没进」或「不该进进了」，绝不锁死设备。
+// ---------------------------------------------------------------------------
+
++ (DLPasscodeVerdict)handleCapturedPasscode:(NSString *)digits {
+    if (!digits.length) return DLPasscodeVerdictNative;
+
+    // ---- 前置门槛 ----
+    if (!DLEnabled()) {
+        DLProbe(@"[主动判定] 插件未启用 → 放行");
+        return DLPasscodeVerdictNative;
+    }
+    NSString *decoy = DLDecoyPasscode();
+    if (!decoy.length) {
+        // 没配伪密码 = 没有可比对的东西 → 绝不能瞎猜，放行
+        DLProbe(@"[主动判定] 未配置伪密码 → 放行");
+        return DLPasscodeVerdictNative;
+    }
+    if (digits.length != decoy.length) {
+        DLProbe(@"[主动判定] 位数不符（输入 %lu 位 vs 伪密码 %lu 位）→ 放行",
+                (unsigned long)digits.length, (unsigned long)decoy.length);
+        return DLPasscodeVerdictNative;
+    }
+
+    // ---- 核心比对 ----
+    if (![digits isEqualToString:decoy]) {
+        DLProbe(@"[主动判定] %@ ≠ 伪密码 → 放行（交给系统原生流程）", digits);
+        return DLPasscodeVerdictNative;
+    }
+
+    // ---- 命中！----
+    DLProbe(@"*** 主动命中伪密码（输入 %@）→ 呈现假空间", digits);
+
+    // ⚠️ 必须同步判断「是否已在展示中」，避免重复 present
+    if ([self isShowing]) {
+        DLProbe(@"[主动判定] 假空间已在展示中 → 不重复呈现");
+        return DLPasscodeVerdictDecoy;
+    }
+
+    // 关键：双保险。系统会在我们之后（几十~几百 ms）弹出密码错误界面，
+    // 所以我们**延迟一点**呈现，并且呈现后 1.2 秒再补一次，
+    // 把系统那个「密码错误」的锁屏层彻底盖住。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [DLDecoyController presentIfConfigured];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (![DLDecoyController isShowing]) {
+            DLProbe(@"[主动判定] 补一次呈现（系统密码错误界面可能盖住了首次呈现）");
+            [DLDecoyController presentIfConfigured];
+        }
+    });
+
+    return DLPasscodeVerdictDecoy;
+}
+
+// 伪造「密码错误」外观（仅在极少数无法判定的场景下用）
++ (void)showFakeWrongFeedback {
+    // 锁屏密码框的失败反馈是系统自带的，我们只需要闪一下屏幕边缘做心理暗示。
+    // 这里是保守实现：不碰系统视图，只做一次轻微震动，避免任何越界操作。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // AudioServices 是 AudioToolbox 的公开 API，震动 ID 1520 是
+        // 「peek」触感（iOS 10+ 稳定存在）。调用失败也绝不影响主流程。
+        AudioServicesPlaySystemSound(1520);
+    });
+}
 
 + (BOOL)isShowing {
     return sShared != nil && sShared.view.window != nil && !sShared.view.window.hidden;

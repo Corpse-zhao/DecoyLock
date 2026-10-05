@@ -18,10 +18,34 @@ extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 #import "DLDecoyController.h"
 
 // ===========================================================================
-// 伪锁屏 · SpringBoard 侧钩子（v0.1.6 重写）
+// 伪锁屏 · SpringBoard 侧钩子（v0.1.14 主动取词版）
 // ===========================================================================
 //
-// v0.1.5 的三个致命错误（本轮全部修掉）：
+// ⭐⭐ v0.1.14 架构转向（前 13 版全部在「等系统回调」，这条路已证明走不通）
+//
+//   v0.1.13 日志的决定性证据：
+//     用户敲完 6 位密码 → 系统**没有**执行
+//       coverSheetViewController:unlockWithRequest:completion:      （0 次）
+//       coverSheetPresentationManager:unlockWithRequest:completion: （0 次）
+//       它直接走了：
+//         23:00:29.812 [侦查] SBUIPasscodeLockViewSimpleFixedDigitKeypad -resetForFailedPasscode
+//         23:00:29.814 [失败回调] ★ resetForFailedPasscode → 系统判定密码错误
+//     → 密码错误路径上，系统**不外露任何携带密码的调用**。
+//       挂再多系统方法也只能知道「错了」，永远拿不到「错的是什么」。
+//
+//   ✅ 新思路：不问了，自己数。
+//      Hook 组 A 从 v0.1.9 起就 100% 能拿到用户每次按键（日志可证）。
+//      所以插件自己做比对：输入长度 = 伪密码长度时，立刻比对；
+//        命中 → 自己把假空间盖上去（不等系统，且覆盖系统随后的错误界面）
+//        不命中 → 什么都不做，系统原生流程照跑（用户看到正常的错误+锁定）
+//
+//   安全性：不吞系统调用、不改写返回值、不等系统回调。
+//           判断错误最多是「没进/多进假空间」，绝不可能锁死设备。
+//
+// ---------------------------------------------------------------------------
+// （以下为历史沿革，保留作为踩坑记录）
+//
+// v0.1.5 的三个致命错误（已在 v0.1.8 全部修掉）：
 //
 //  ❌ 错误 1：%hook UIResponder / -insertText:
 //     `insertText:` 不是 UIResponder 自己实现的方法，而是 UIKeyInput 协议要求
@@ -35,31 +59,7 @@ extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 //     `-setText:`，任何消息转发/响应性探测（respondsToSelector:）都会被污染。
 //
 //  ❌ 错误 3：钩子目标全是「猜测的类名」
-//     SBLockScreenViewController -passcodeEntryFieldDidSucceed: /
-//     SBLockScreenManager -unlockWithIntent: —— iOS 16 上这两个方法
-//     **都不存在**（前者是 iOS 14 时代的名字，后者签名完全对不上）。
-//     Logos 对不存在的类/方法**不报错**，所以 CI 全绿、装上也毫无反应。
-//
-// 本版策略（不再猜类名，改成「运行时反射 + 通配钩子 + 时间窗」）：
-//
-//  ① 输入捕获：hook **SBUIPasscodeEntryField** 的 setText: / clear /
-//     appendString: 与 UITextField 的 deleteBackward —— 前者是锁屏密码框
-//     的通用基类（iOS 6~17 都在），后者是键盘删除键的事实标准。
-//     另加 **yield 模式**：解锁判定那一瞬间，直接遍历所有 UIWindow 找
-//     「类名含 Passcode 且响应 text 选择器」的视图，读它当前文本。
-//     → 这一路完全不依赖任何钩子命中，是本版的**主路径**。
-//
-//  ② 解锁判定点：用 `-attemptUnlockWithPasscode:`（iOS 6~17 恒存在的
-//     「尝试用密码解锁」点），并以 `$` 前缀让 Logos 对**所有类的同名方法**
-//     生效 —— 不去赌它挂在 SBDeviceLockController 还是 SBLockScreenManager。
-//     → 这是「不用猜类名」的关键技巧，见 SKILL §0.0.12。
-//
-//  ③ 判定窗口：密码框输入后 25 秒内到达的解锁调用才算「本次输入的结果」。
-//     解决「SBLockScreenViewController 生命周期太长，缓冲区被历史输入污染」
-//     的问题，同时避免旧输入串门触发假空间。
-//
-//  ④ 绝不锁死设备：任何一步失败都直接放行原生流程（return %orig）。
-//     伪空间失败最多「没效果」，不可能让用户进不去系统。
+//     Logos 对不存在的类/方法**不报错**，CI 全绿、装上也毫无反应。
 // ===========================================================================
 
 static NSString *const kDLBundleID = @"com.apple.springboard";
@@ -99,6 +99,48 @@ static void DLResetInput(void) {
 static void DLLogInputCapture(NSString *src);
 
 // ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.14 核心：输入长度够了就**主动**判定，不再等系统回调
+//
+// 这是本版与 v0.1.13 的唯一本质区别：
+//   旧：输入 → 等系统调用某个带密码的方法 → 在那里面比对（等不到，永远不触发）
+//   新：输入 → 自己发现「够位数了」→ 自己去比对（不依赖系统任何行为）
+//
+// 只在「长度恰好等于伪密码位数」时触发一次，避免每敲一键都跑一遍；
+// 判完之后把缓冲清掉，防止同一次输入被判两次。
+// ---------------------------------------------------------------------------
+static void DLTriggerActiveVerdict(NSString *src) {
+    if (!DLIsSpringBoard()) return;
+
+    NSString *digits = [DLInputBuffer() copy];
+    NSUInteger need = DLDecoyPasscode().length;
+
+    // 长度没到 / 超过 → 不判（超过说明用户在继续输入，交给系统原生流程）
+    if (need == 0 || digits.length != need) return;
+
+    // ⚠️ 防重复：同一次输入只判一次
+    static NSString *lastJudged = nil;
+    if (lastJudged && [lastJudged isEqualToString:digits]) {
+        DLProbe(@"[主动判定] %@ 已判定过 → 跳过", digits);
+        return;
+    }
+    lastJudged = [digits copy];
+
+    DLProbe(@"[主动判定] 输入已达 %lu 位（源=%@）→ 开始比对伪密码",
+            (unsigned long)digits.length, src);
+
+    DLPasscodeVerdict v = [DLDecoyController handleCapturedPasscode:digits];
+
+    if (v == DLPasscodeVerdictDecoy) {
+        DLProbe(@"[主动判定] ✅ 命中伪密码 → 假空间已排出呈现队列");
+        DLResetInput();       // 清掉，避免残留影响下一次
+    } else {
+        DLProbe(@"[主动判定] ➡️ 非伪密码 → 不干预，交给系统原生流程");
+        // ⚠️ 不清空：不清空的话用户继续输入时 lastJudged 逻辑仍能防重；
+        //    清空的话会丢掉「用户真实密码」的痕迹，没必要。
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 覆盖式写入：密码框给什么，缓冲就是什么。
 // 直接用 setText: 的真实内容，比「自己 append 按键」准确得多
 // （退格、粘贴、自动填充全都自动正确）。
@@ -114,6 +156,7 @@ static void DLSetInput(NSString *text, NSString *src) {
     DLProbe(@"[输入] 源=%@ 内容=%@ len=%lu",
             gDLLastSrc, t.length ? t : @"(空)", (unsigned long)t.length);
     DLLogInputCapture(gDLLastSrc);
+    DLTriggerActiveVerdict(gDLLastSrc);          // ⭐ v0.1.14 主动判定
 }
 
 static void DLAppendInput(NSString *text, NSString *src) {
@@ -128,6 +171,7 @@ static void DLAppendInput(NSString *text, NSString *src) {
     DLProbe(@"[输入] 源=%@ 追加=%@ 结果 len=%lu",
             gDLLastSrc, text, (unsigned long)DLInputBuffer().length);
     DLLogInputCapture(gDLLastSrc);      // v0.1.10：长度够了就打一行
+    DLTriggerActiveVerdict(gDLLastSrc); // ⭐ v0.1.14 主动判定
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +300,8 @@ static BOOL DLShouldHijackUnlock(NSString *from) {
 
 // ===========================================================================
 // Hook 组 A：密码输入框（真正实现 setText: 的类）
+// ⭐ v0.1.14：这里是**主动取词的主入口** —— appendString:/setText: 一命中，
+//    立刻检查长度，够位数就直接比对（见 DLTriggerActiveVerdict）。
 // ===========================================================================
 
 // 侦查挂钩（定义在 Hook 组 C2，先给前向声明 —— C 要求先声明后用）
@@ -957,7 +1003,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.13 解锁请求挂钩版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.14 主动取词版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1053,15 +1099,18 @@ static void DLDumpEnvironment(void) {
 }
 
 // ---------------------------------------------------------------------------
-// ⭐ v0.1.10：输入捕获自检（用户说「输够 6 位」时立即打一行）
+// ⭐ v0.1.10：输入捕获自检（用户说「输够 N 位」时立即打一行）
 //    这样能立刻区分两种失败：
 //      a) 系统根本没走 appendString:（len 涨不上去）→ 输入捕获失效
-//      b) len 到了 6 但从没进判定分支 → 阈值/判定条件写错了
+//      b) len 到了 N 但没进判定 → 阈值/判定条件写错了
+//
+//    v0.1.14：不再说「等待系统验证调用」—— 现在是**插件自己主动判定**，
+//    所以这行后面紧跟的应该就是 `[主动判定]` 那一行。
 // ---------------------------------------------------------------------------
 static void DLLogInputCapture(NSString *src) {
     NSUInteger len = DLInputBuffer().length;
     if (len == DLDecoyPasscode().length && len > 0) {
-        DLProbe(@"✅ 输入长度已达伪密码位数（%lu 位，源=%@）→ 等待系统验证调用",
+        DLProbe(@"✅ 输入长度已达伪密码位数（%lu 位，源=%@）→ 立即主动判定",
                 (unsigned long)len, src);
     }
 }
@@ -1152,7 +1201,16 @@ static void DLLogInputCapture(NSString *src) {
 %end
 
 // ---------------------------------------------------------------------------
-// ⭐ v0.1.13：失败回调 —— 用于确认「验证判定发生在这个方法之前」
+// ⭐ v0.1.14：失败回调 —— **兜底**判定点（不再只是日志）
+//
+// 主路径是「输入够位数就主动判定」（见 DLTriggerActiveVerdict）。
+// 但存在一种边界情况：用户用某种输入方式（粘贴 / 自动填充 / 键盘直接
+// 替换整个字符串）绕过了 appendString:，导致我们的缓冲没抓到。
+//
+// 此时系统仍然会走 resetForFailedPasscode（v0.1.13 实测确认它 100% 触发）。
+// 所以这里做**第二道防线**：在系统判定失败的那一刻，再从视图树里
+// 把密码框的文本抠出来比对一次（DLSniffPasscodeFromWindows）。
+// 命中伪密码 → 照样把假空间盖上去。
 // ---------------------------------------------------------------------------
 @interface SBUIPasscodeLockViewBase : UIView
 @end
@@ -1160,6 +1218,23 @@ static void DLLogInputCapture(NSString *src) {
 %hook SBUIPasscodeLockViewBase
 - (void)resetForFailedPasscode {
     DLProbe(@"[失败回调] ★ resetForFailedPasscode 被调用 → 系统判定密码错误");
+
+    // ---- 兜底：主路径没抓到输入时，这里补一次 ----
+    @try {
+        if (DLEnabled() && DLDecoyPasscode().length) {
+            NSString *sniffed = DLSniffPasscodeFromWindows();
+            DLProbe(@"[失败回调] 兜底抠取密码框文本=%@",
+                    sniffed.length ? sniffed : @"(失败)");
+            if (sniffed.length) {
+                DLPasscodeVerdict v = [DLDecoyController handleCapturedPasscode:sniffed];
+                if (v == DLPasscodeVerdictDecoy) {
+                    DLProbe(@"[失败回调] ✅ 兜底命中伪密码 → 呈现假空间（盖住错误界面）");
+                    DLResetInput();
+                }
+            }
+        }
+    } @catch (__unused NSException *e) { }
+
     %orig;
 }
 %end
