@@ -1,5 +1,7 @@
 #import "DLRootListController.h"
 #import <notify.h>
+#import <spawn.h>
+#import <sys/wait.h>
 
 // ---------------------------------------------------------------------------
 // 设置面板（运行在「设置」App 进程，不受沙盒限制）
@@ -238,26 +240,53 @@ static NSArray *DLFakeApps(void) {
 
 - (void)save {
     NSMutableDictionary *cfg = DLPrefsLoad();
-    NSArray *ordered = [self.apps orderWithSelection:self.selected];
+    NSArray *ordered = [self.apps dlOrderWithSelection:self.selected];
     cfg[@"decoy_apps"] = ordered;
     DLPrefsSave(cfg);
     [self.navigationController popViewControllerAnimated:YES];
 }
 
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
+    return 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return (NSInteger)DLFakeApps().count + 1;   // +1 = 顶部说明行
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    UITableViewCell *cell = [super tableView:tv cellForRowAtIndexPath:ip];
-    if (ip.section == 0 && ip.row > 0) {
-        NSInteger idx = ip.row - 1;
-        NSArray *all = DLFakeApps();
-        if (idx < (NSInteger)all.count) {
-            NSString *ident = all[(NSUInteger)idx][@"id"];
-            BOOL on = [self.selected containsObject:ident];
-            cell.accessoryType = on ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        }
-    } else if (ip.section == 0 && ip.row == 0) {
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    // ⚠️ 不要依赖 [super tableView:...] —— 私有 PSListController 的方法名不同版本有差异。
+    //    自己构造 cell，完全可控。
+    static NSString *cellID = @"DLAppPickerCell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cellID];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                      reuseIdentifier:cellID];
     }
+    cell.textLabel.text = @"";
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+
+    if (ip.section != 0) return cell;
+
+    if (ip.row == 0) {
+        cell.textLabel.text = @"勾选后显示在假空间里";
+        cell.textLabel.textColor = [UIColor secondaryLabelColor];
+        cell.textLabel.font = [UIFont systemFontOfSize:13.0];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        return cell;
+    }
+
+    NSInteger idx = ip.row - 1;
+    NSArray *all = DLFakeApps();
+    if (idx < 0 || idx >= (NSInteger)all.count) return cell;
+
+    NSString *ident = all[(NSUInteger)idx][@"id"];
+    cell.textLabel.text = all[(NSUInteger)idx][@"name"];
+    cell.textLabel.textColor = [UIColor labelColor];
+    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
+    cell.accessoryType = [self.selected containsObject:ident]
+        ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     return cell;
 }
 
@@ -283,7 +312,7 @@ static NSArray *DLFakeApps(void) {
 
 // NSArray 的便捷排序（保持内置清单顺序，不按勾选顺序）
 @implementation NSArray (DLOrder)
-- (NSArray *)orderWithSelection:(NSSet *)sel {
+- (NSArray *)dlOrderWithSelection:(NSSet *)sel {
     NSMutableArray *out = [NSMutableArray array];
     for (NSDictionary *a in DLFakeApps()) {
         if ([sel containsObject:a[@"id"]]) [out addObject:a[@"id"]];

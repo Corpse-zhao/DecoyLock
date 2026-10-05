@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <unistd.h>
 
 #define DL_VERSION      @"0.1.0"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"

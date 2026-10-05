@@ -11,19 +11,26 @@
 - (id)propertyForKey:(NSString *)key;
 @end
 
-@interface PSListController : UIViewController {
+@interface PSListController : UIViewController <UITableViewDataSource, UITableViewDelegate> {
     @protected
     NSArray *_specifiers;
 }
 - (NSArray *)loadSpecifiersFromPlistName:(NSString *)name target:(id)target;
 - (void)reloadSpecifiers;
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier;
+- (id)readPreferenceValue:(PSSpecifier *)specifier;
+- (UITableView *)table;
 @end
 
 @interface DLRootListController : PSListController
 @end
 
 @interface DLAppPickerController : PSListController
+@end
+
+// 保持内置清单顺序的便捷方法（实现见 .m）
+@interface NSArray (DLOrder)
+- (NSArray *)dlOrderWithSelection:(NSSet *)sel;
 @end
 
 #endif /* DLRootListController_h */
