@@ -18,10 +18,12 @@ jobs:
         run: |
           brew install make xz ldid
 
-      - name: Setup Theos
+      - name: Setup Theos (roothide 分支)
         run: |
           export THEOS=$HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
+          # ⚠️ 必须用 roothide/theos：官方 theos 没有 roothide package scheme，
+          #    会报 "'roothide' package scheme does not exist"（scheme 模块在 vendor/mod/roothide）
+          git clone --recursive https://github.com/roothide/theos.git $THEOS
           # ⚠️ sdks 目录必须一次性建好：先 clone 到临时目录再 sparse-checkout，
           #    不要 `cd $THEOS/sdks && git clone ... .`（目录已存在会 fatal 128）
           git clone --depth 1 --filter=blob:none --sparse \
@@ -31,13 +33,16 @@ jobs:
           mv iPhoneOS14.5.sdk $THEOS/sdks/
           rm -rf $THEOS/sdks-tmp
           ls $THEOS/sdks/
+          ls $THEOS/vendor/mod/
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
       - name: Build package
         run: |
           export THEOS=$HOME/theos
-          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 2>&1 | tail -60
+          # ⚠️ 不要接 `| tail -60`：会把 make 的退出码吞掉，scheme 报错也显示 success
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+          ls -la packages/
 
       - name: Inspect package contents
         run: |
