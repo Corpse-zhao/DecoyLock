@@ -16,7 +16,11 @@
 #import <dlfcn.h>
 #import <unistd.h>
 #import <signal.h>
-#import <libproc.h>
+
+// libproc.h 不在 iOS SDK 中，但函数在 libSystem 里 —— 手动声明
+#define PROC_ALL_PIDS 1
+extern int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+extern int proc_name(pid_t pid, void *buffer, uint32_t buffersize);
 
 // 配置域
 static NSString *const kDLDomain = @"com.blr.decoylock";
