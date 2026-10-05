@@ -296,7 +296,7 @@ static void DLEnsureReconForPasscodeField(id field);
 - (void)deleteBackward {
     %orig;
     if (!DLIsSpringBoard()) return;
-    NSString *cls = NSStringFromClass([self class]);
+    NSString *cls = NSStringFromClass(object_getClass(self));
     BOOL related = [cls containsString:@"Passcode"] ||
                    [cls containsString:@"Pearl"];
     if (!related) {
@@ -365,17 +365,21 @@ typedef BOOL (*DLAttemptIMP)(id, SEL, id);
 static BOOL DLAttemptUnlockReplacement(id self, SEL _cmd, id passcode) {
     if (DLShouldHijackUnlock(@"runtime.attemptUnlockWithPasscode")) {
         DLProbe(@"[放行控制] %@ 的解锁调用被吞掉（返回 NO）",
-                NSStringFromClass([self class]));
+                NSStringFromClass(object_getClass(self)));
         return NO;      // 告诉系统「解锁失败」，密码框留在锁屏
     }
 
     // 放行：找到该类自己的原始 IMP
-    NSString *key = NSStringFromClass([self class]);
+    // ⚠️ 用 object_getClass(self) 而不是 [self class] —— KVO/动态子类场景下
+    //    后者会返回「被观察前的类名」，查表会查空 → 行为被改写。
+    Class realClass = object_getClass(self);
+    NSString *key = NSStringFromClass(realClass);
     NSValue *boxed = gDLOrigIMPs[key];
     if (!boxed) {
-        // 兜底：往继承链上方找
-        Class c = class_getSuperclass([self class]);
-        while (c && !boxed) {
+        // 兜底：往继承链上方找（上限 24 层防环）
+        Class c = class_getSuperclass(realClass);
+        int guard = 0;
+        while (c && !boxed && guard++ < 24) {
             boxed = gDLOrigIMPs[NSStringFromClass(c)];
             c = class_getSuperclass(c);
         }
