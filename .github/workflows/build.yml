@@ -1,0 +1,128 @@
+name: Build DecoyLock
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          brew install make xz ldid
+
+      - name: Setup Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          mkdir -p $THEOS/sdks
+          cd $THEOS/sdks
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git .
+          git sparse-checkout set iPhoneOS14.5.sdk
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          gmake package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 2>&1 | tail -60
+
+      - name: Inspect package contents
+        run: |
+          python3 - <<'PY'
+          import glob, io, tarfile
+          for path in sorted(glob.glob("packages/*.deb")):
+              print("==>", path)
+              raw = open(path, "rb").read()
+              off, data_tar = 8, None
+              while off < len(raw):
+                  hdr = raw[off:off+60]
+                  if len(hdr) < 60: break
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  try:
+                      size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception:
+                      break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): data_tar = body
+              if data_tar:
+                  try:
+                      with tarfile.open(fileobj=io.BytesIO(data_tar)) as tf:
+                          for n in sorted(tf.getnames()):
+                              if not n.endswith("/"): print("   ", n)
+                  except Exception as e:
+                      print("   [!] tar read failed:", e)
+          PY
+
+      - name: Diagnose Mach-O slices
+        run: |
+          python3 - <<'PY'
+          import glob, io, tarfile, struct, os
+          def slices(b):
+              out = []
+              if b[:4] == b"\xca\xfe\xba\xbe":
+                  n = struct.unpack(">I", b[4:8])[0]
+                  off = 8
+                  for _ in range(n):
+                      ct, cs, o, sz, al = struct.unpack(">IIIII", b[off:off+20]); off += 20
+                      out.append((hex(ct), hex(cs), sz))
+              elif b[:4] == b"\xcf\xfa\xed\xfe":
+                  ct, cs = struct.unpack("<ii", b[4:12])
+                  out.append((hex(ct & 0xffffffff), hex(cs & 0xffffffff), len(b)))
+              return out
+          for path in sorted(glob.glob("packages/*.deb")):
+              raw = open(path, "rb").read()
+              off, data_tar = 8, None
+              while off < len(raw):
+                  hdr = raw[off:off+60]
+                  if len(hdr) < 60: break
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  try: size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception: break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): data_tar = body
+              if not data_tar: continue
+              try:
+                  with tarfile.open(fileobj=io.BytesIO(data_tar)) as tf:
+                      for m in tf.getmembers():
+                          if m.isfile() and (m.name.endswith(".dylib")):
+                              b = tf.extractfile(m).read()
+                              print(m.name, os.path.getsize(path), slices(b))
+              except Exception as e:
+                  print("[!] ", e)
+          PY
+        continue-on-error: true
+
+      - name: Show control
+        run: |
+          for p in packages/*.deb; do echo "== $p"; dpkg-deb -f "$p" 2>/dev/null || python3 -c "
+          import sys
+          raw=open('$p','rb').read(); off=8
+          while off < len(raw):
+              hdr=raw[off:off+60]
+              if len(hdr)<60: break
+              n=hdr[0:16].decode(errors='ignore').strip()
+              s=int(hdr[48:58].decode(errors='ignore').strip()); off+=60
+              b=raw[off:off+s]; off+=s+(s%2)
+              if n.startswith('control.tar'):
+                  import io,tarfile
+                  with tarfile.open(fileobj=io.BytesIO(b)) as tf:
+                      print(tf.extractfile('control').read().decode()) if False else print(tf.extractfile('./control').read().decode())
+          "; done
+        continue-on-error: true
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: DecoyLock-deb
+          path: packages/*.deb
+          if-no-files-found: error

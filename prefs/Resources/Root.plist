@@ -1,0 +1,85 @@
+{
+    "items": [
+        {
+            "cell": "PSGroupCell",
+            "label": "伪锁屏",
+            "footerText": "输入正确密码进入真系统；输入伪密码进入可自定义的假空间。设好伪密码后记得打开总开关。"
+        },
+        {
+            "cell": "PSSwitchCell",
+            "label": "启用插件",
+            "key": "enabled",
+            "default": false
+        },
+        {
+            "cell": "PSGroupCell",
+            "label": "伪密码",
+            "footerText": "4~8 位纯数字。不要与你的真实锁屏密码相同。"
+        },
+        {
+            "cell": "PSTextFieldSpecifier",
+            "label": "伪密码",
+            "key": "decoy_passcode",
+            "default": "",
+            "keyboardType": 4,
+            "isSecure": true,
+            "autoCapitalizationType": 0,
+            "autoCorrectionType": 1
+        },
+        {
+            "cell": "PSGroupCell",
+            "label": "假空间外观"
+        },
+        {
+            "cell": "PSTextFieldSpecifier",
+            "label": "顶部标题",
+            "key": "decoy_title",
+            "default": "我的 iPhone",
+            "autoCapitalizationType": 0,
+            "autoCorrectionType": 1
+        },
+        {
+            "cell": "PSTextFieldSpecifier",
+            "label": "副标题",
+            "key": "decoy_subtitle",
+            "default": "",
+            "autoCapitalizationType": 0,
+            "autoCorrectionType": 1
+        },
+        {
+            "cell": "PSGroupCell",
+            "label": "假空间 App",
+            "footerText": "该界面由本插件独立绘制，不会真正打开任何应用。修改后需重启桌面（respring）生效。"
+        },
+        {
+            "cell": "PSLinkCell",
+            "label": "选择要显示的 App",
+            "detail": "DLAppPickerController"
+        },
+        {
+            "cell": "PSGroupCell",
+            "label": "退出与诊断",
+            "footerText": "假空间内的隐藏退出方式：在顶部标题处连点 8 次，或长按空白壁纸 3 秒。"
+        },
+        {
+            "cell": "PSButtonCell",
+            "label": "重启桌面生效",
+            "action": "respring"
+        },
+        {
+            "cell": "PSButtonCell",
+            "label": "查看运行诊断",
+            "action": "showProbe"
+        },
+        {
+            "cell": "PSButtonCell",
+            "label": "清除诊断日志",
+            "action": "clearProbe"
+        },
+        {
+            "cell": "PSGroupCell",
+            "label": "",
+            "footerText": "伪锁屏 v0.1.0 · 作者 板栗仁"
+        }
+    ]
+}

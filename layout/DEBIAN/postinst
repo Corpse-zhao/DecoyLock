@@ -1,0 +1,12 @@
+#!/bin/bash
+# 伪锁屏 postinst
+# 预建共享目录并放开权限，使 SpringBoard 与「设置」进程都能读写
+DIR="/var/mobile/Documents/伪锁屏"
+mkdir -p "$DIR"
+chmod 777 "$DIR"
+chown mobile:mobile "$DIR" 2>/dev/null || true
+
+# 清掉可能存在的旧诊断日志（升级场景）
+rm -f "$DIR/_probe.txt" 2>/dev/null || true
+
+exit 0
