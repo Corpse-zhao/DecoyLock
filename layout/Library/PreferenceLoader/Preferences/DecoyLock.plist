@@ -3,4 +3,5 @@
     isController = true;
     entryControllerClass = "DLRootListController";
     label = "伪锁屏";
+    icon = "icon.png";
 }
