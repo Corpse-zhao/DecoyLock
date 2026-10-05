@@ -540,7 +540,9 @@ static CFAbsoluteTime gDLReconLastLog = 0.0;        // 日志限流
 static int gDLReconLogCount = 0;                    // 本次窗口已记录条数
 
 static void DLReconOpenWindow(void) {
-    gDLReconUntil = CFAbsoluteTimeGetCurrent() + 20.0;
+    // ⭐ v0.1.11：窗口从 20 秒拉到 60 秒 —— 锁屏输错后有「惩罚倒计时」，
+    //    验证回调可能比输入晚很多；窗口太短会漏掉关键调用。
+    gDLReconUntil = CFAbsoluteTimeGetCurrent() + 60.0;
 }
 
 static BOOL DLReconInWindow(void) {
@@ -566,14 +568,20 @@ static id DLReconOrigLookup(id self, SEL _cmd) {
     return nil;
 }
 
-// ⭐ 日志：整体 @try + 限流。磁盘 IO 失败绝不能影响 SpringBoard。
+// ⭐ 日志：整体 @try + 轻限流。磁盘 IO 失败绝不能影响 SpringBoard。
+//
+// ⚠️ v0.1.10 教训：限流 0.5 秒（2 条/秒）+ 封顶 400 条
+//    → 锁屏验证是**突发**调用（几百毫秒内几十次），被限流吃掉后
+//      日志里一行 `[侦查]` 都看不到，白白浪费一轮排查。
+//    改为：**只做最小限流**（50ms，20 条/秒）+ 提高封顶（1500 条），
+//    保证突发调用能全部落盘。日志变长一点可以接受 —— 定位比简短重要。
 static void DLReconLog(id self, SEL _cmd) {
     @try {
         if (!DLReconInWindow()) return;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (now - gDLReconLastLog < 0.5) return;    // 限流：2 条/秒
+        if (now - gDLReconLastLog < 0.05) return;   // 20 条/秒
         gDLReconLastLog = now;
-        if (gDLReconLogCount++ > 400) return;       // 单次窗口封顶
+        if (gDLReconLogCount++ > 1500) return;
         DLProbe(@"[侦查] %@ -%@",
                 NSStringFromClass(object_getClass(self)),
                 NSStringFromSelector(_cmd));
@@ -964,7 +972,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.11 全量侦查版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.12 CoverSheet侦查版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1028,19 +1036,29 @@ static void DLDumpEnvironment(void) {
             NSString *imgName = img ? [[NSString stringWithUTF8String:img] lastPathComponent]
                                     : @"?";
             // 统计它实现的「白名单」方法数，方便一眼看出谁是验证者
+            // ⭐ v0.1.11：不只数个数，**把命中的方法名也打出来**
+            //    （v0.1.10 只打了计数 → 看到「白名单1」却不知道是哪个方法，白跑一轮）
             int wlCount = 0;
+            NSMutableArray *wlHits = [NSMutableArray array];
             NSArray *wl = DLReconWhiteList();
             unsigned int mc = 0;
             Method *ms = class_copyMethodList(c, &mc);
             if (ms) {
                 for (unsigned int j = 0; j < mc; j++) {
-                    if ([wl containsObject:NSStringFromSelector(method_getName(ms[j]))])
+                    NSString *sn = NSStringFromSelector(method_getName(ms[j]));
+                    if ([wl containsObject:sn]) {
                         wlCount++;
+                        [wlHits addObject:sn];
+                    }
                 }
                 free(ms);
             }
-            [suspects addObject:[NSString stringWithFormat:@"%@(%@,白名单%d)",
-                                 n, imgName, wlCount]];
+            [suspects addObject:[NSString stringWithFormat:@"%@(%@,白名单%d%@)",
+                                 n, imgName, wlCount,
+                                 wlHits.count
+                                     ? [@"=" stringByAppendingString:
+                                        [wlHits componentsJoinedByString:@"+"]]
+                                     : @""]];
         }
         free(allClasses);
     }
@@ -1095,14 +1113,20 @@ static void DLBootRound(void) {
         //     且签名校验保证转发安全。
         if (gDLBootRounds == 1) {
             NSArray *allRecon = @[
-                @"SBLockScreenManager",
-                @"SBUIPasscodeEntryField",
+                // ⭐ v0.1.11 实测定位：真凶在 CoverSheet 框架里
+                @"CSPasscodeViewController",
+                @"CSModalPresentationViewController",
+                @"CSCoverSheetViewController",
+                // 真正的输入视图（SBUIPasscodeEntryField 是它的父类）
+                @"SBUISimpleFixedDigitPasscodeEntryField",
+                // 这两个「白名单命中 1」→ 真的实现了某个我们列的方法名，重点看
                 @"SBUIPasscodeLockViewWithKeypad",
-                @"SBUIPasscodeLockViewSimpleFixedDigitKeypad",
+                @"SBUIPasscodeLockViewWithKeyboard",
+                // 老目标保留
+                @"SBLockScreenManager",
                 @"SBLockScreenView",
                 @"SBLockScreenLockingViewController",
                 @"SBLockScreenCombinedLockViewController",
-                @"SBDeviceLockStateProvider",
             ];
             for (NSString *cn in allRecon) {
                 Class c = NSClassFromString(cn);
