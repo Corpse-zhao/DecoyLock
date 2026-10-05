@@ -123,6 +123,14 @@ jobs:
             fi
           fi
 
+          echo "--- 检查 7：原 IMP 查表不能用 [self class]（KVO 动态子类会拿到假类名） ---"
+          if grep -nE 'NSStringFromClass\(\[self class\]\)' Tweak.x \
+               | grep -vE '^\s*[0-9]+:\s*//'; then
+            echo "❌ 原 IMP 查表用了 [self class]。KVO 场景下会返回被观察前的类名 → 查表查空。"
+            echo "   改用 object_getClass(self)，并沿继承链向上找（上限 24 层防环）。"
+            FAIL=1
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"
