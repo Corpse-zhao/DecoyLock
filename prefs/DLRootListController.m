@@ -15,7 +15,8 @@
 #import <sys/wait.h>
 #import <dlfcn.h>
 #import <unistd.h>
-#import <stdlib.h>
+#import <signal.h>
+#import <libproc.h>
 
 // 配置域
 static NSString *const kDLDomain = @"com.blr.decoylock";
@@ -176,20 +177,34 @@ static NSString *DLKillallPath(void) {
     return nil;
 }
 
+// ⚠️ respring 首选：proc_listpids 枚举 + kill(SIGKILL) —— 无子进程、无 PATH 依赖。
+//    （posix_spawn /usr/bin/killall 在 roothide 的沙盒设置进程里可能被静默拦掉，
+//     用户实测「点了没反应」；system() 在 iOS SDK 被 unavailable。）
 static void DLDoRespring(void) {
-    pid_t pid = 0;
-    int status = 0;
-    int rc = -1;
+    int n = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (n > 0) {
+        pid_t *pids = (pid_t *)calloc(1, (NSUInteger)n + 64);
+        int m = proc_listpids(PROC_ALL_PIDS, 0, pids, n + 64);
+        for (int i = 0; i < m / (int)sizeof(pid_t); i++) {
+            char name[256] = {0};
+            if (proc_name(pids[i], name, sizeof(name)) <= 0) continue;
+            if (strcmp(name, "SpringBoard") == 0) {
+                kill(pids[i], SIGKILL);
+                break;
+            }
+        }
+        free(pids);
+    }
+
+    // 备用（前面失败时仍能杀到）：spawn killall
     NSString *kp = DLKillallPath();
     if (kp) {
+        pid_t pid = 0;
+        int st = 0;
         const char *args[] = {"killall", "-9", "SpringBoard", NULL};
-        rc = posix_spawn(&pid, [kp fileSystemRepresentation], NULL, NULL,
-                         (char *const *)args, NULL);
-        if (rc == 0) waitpid(pid, &status, 0);
-    }
-    if (rc != 0) {
-        // 兜底：走 shell 的 PATH 搜索（roothide 注入的 PATH 一般含 jbroot/usr/bin）
-        system("killall -9 SpringBoard 2>/dev/null");
+        posix_spawn(&pid, [kp fileSystemRepresentation], NULL, NULL,
+                    (char *const *)args, NULL);
+        waitpid(pid, &st, 0);
     }
 }
 
