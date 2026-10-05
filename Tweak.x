@@ -787,6 +787,97 @@ static void DLReconClass(Class c, NSString *reason) {
     } @catch (__unused NSException *e) { }
 }
 
+// ---------------------------------------------------------------------------
+// ⭐ v0.1.11 新增：重点类「全量侦查」（不筛方法名，只筛签名安全性）
+//
+// v0.1.10 的教训：白名单是**我猜的**，猜不中就永远找不到真凶。
+// 但全量挂所有类的所有方法风险太大（v0.1.7 就是这么崩的）。
+//
+// 折中方案：只对**极少数几个「确定存在且一定在锁屏生命周期里」的类**
+// 做全量签名安全挂钩 —— 这些类的方法数量有限（几十个），日志不会爆，
+// 且签名校验保证不会崩。
+//
+// 与 DLReconClass 的唯一区别：**不筛方法名，只筛签名**。
+// ---------------------------------------------------------------------------
+static void DLReconClassAllMethods(Class c, NSString *reason) {
+    @try {
+        if (!c || !DLIsSpringBoard()) return;
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length || [cn hasPrefix:@"_"]) return;
+
+        const char *image = class_getImageName(c);
+        if (!image) return;
+        NSString *imgPath = [NSString stringWithUTF8String:image];
+        if (![imgPath hasPrefix:@"/System/Library/"] &&
+            ![imgPath hasPrefix:@"/usr/lib/"]) return;
+
+        static NSMutableSet *done = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ done = [NSMutableSet set]; });
+        NSString *tag = [cn stringByAppendingString:@"#ALL"];
+        if ([done containsObject:tag]) return;
+        [done addObject:tag];
+
+        if (!gDLReconClasses) {
+            gDLReconClasses = [NSMutableArray array];
+            gDLReconOrig = [NSMutableDictionary dictionary];
+        }
+
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        int hooked = 0, skipped = 0;
+        NSMutableArray *names = [NSMutableArray array];
+        for (unsigned int i = 0; i < mc; i++) {
+            NSString *selName = NSStringFromSelector(method_getName(ms[i]));
+            if (!selName.length) continue;
+            // 跳过明显无关的（getter/setter/内存管理/描述）—— 纯粹为了日志可读
+            if ([selName hasPrefix:@"set"] || [selName hasPrefix:@"_"] ||
+                [selName hasPrefix:@"."] || [selName isEqualToString:@"description"] ||
+                [selName isEqualToString:@"dealloc"] ||
+                [selName isEqualToString:@"class"] ||
+                [selName isEqualToString:@"hash"] ||
+                [selName isEqualToString:@"isEqual:"]) continue;
+
+            // ⭐ 唯一筛选：签名必须能安全通用转发
+            BOOL isVoid = NO;
+            unsigned int nargs = 0;
+            if (!DLReconSignatureOK(ms[i], &isVoid, &nargs)) { skipped++; continue; }
+
+            IMP repl;
+            if (isVoid) {
+                if (nargs == 0)      repl = (IMP)DLReconV0;
+                else if (nargs == 1) repl = (IMP)DLReconV1;
+                else if (nargs == 2) repl = (IMP)DLReconV2;
+                else                 repl = (IMP)DLReconV3;
+            } else {
+                if (nargs == 0)      repl = (IMP)DLReconI0;
+                else if (nargs == 1) repl = (IMP)DLReconI1;
+                else if (nargs == 2) repl = (IMP)DLReconI2;
+                else                 repl = (IMP)DLReconI3;
+            }
+
+            IMP old = NULL;
+            MSHookMessageEx(c, method_getName(ms[i]), repl, &old);
+            if (old) {
+                gDLReconOrig[[cn stringByAppendingString:selName]] =
+                    [NSValue valueWithPointer:(void *)old];
+                hooked++;
+                [names addObject:[NSString stringWithFormat:@"%@(%u参,%@)",
+                                  selName, nargs, isVoid ? @"void" : @"id"]];
+            } else {
+                skipped++;
+            }
+        }
+        if (ms) free(ms);
+        DLProbe(@"[全量挂] %@（%@）：挂 %d 个，跳过 %d 个",
+                cn, reason ?: @"?", hooked, skipped);
+        if (names.count) {
+            DLProbe(@"[全量挂] %@ 方法清单：%@", cn,
+                    [names componentsJoinedByString:@", "]);
+        }
+    } @catch (__unused NSException *e) { }
+}
+
 // 密码框的 delegate 才是「验证发起者」—— 运行时取它的类来侦查，零猜测
 static void DLEnsureReconForPasscodeField(id field) {
     @try {
@@ -873,7 +964,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.10 上行链侦查版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.11 全量侦查版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -993,6 +1084,31 @@ static void DLBootRound(void) {
         // 侦查挂钩：对嫌疑类挂钩，日志会告诉我们真实的密码验证方法名
         Class sm = NSClassFromString(@"SBLockScreenManager");
         if (sm) DLReconClass(sm, @"启动侦查");
+
+        // ⭐ v0.1.11：重点类「全量侦查」（不筛方法名，只筛签名安全性）
+        //
+        // 为什么只挑这几个类（而不是全 runtime）：
+        //   v0.1.10 白名单是我猜的，猜不中就没有答案。
+        //   但全量挂所有类会重演 v0.1.7 的崩溃。
+        //   → 折中：只挂「确认存在 + 一定在锁屏生命周期里」的类。
+        //     这些类方法数有限（几十个），日志不会爆，
+        //     且签名校验保证转发安全。
+        if (gDLBootRounds == 1) {
+            NSArray *allRecon = @[
+                @"SBLockScreenManager",
+                @"SBUIPasscodeEntryField",
+                @"SBUIPasscodeLockViewWithKeypad",
+                @"SBUIPasscodeLockViewSimpleFixedDigitKeypad",
+                @"SBLockScreenView",
+                @"SBLockScreenLockingViewController",
+                @"SBLockScreenCombinedLockViewController",
+                @"SBDeviceLockStateProvider",
+            ];
+            for (NSString *cn in allRecon) {
+                Class c = NSClassFromString(cn);
+                if (c) DLReconClassAllMethods(c, @"全量侦查");
+            }
+        }
 
         DLProbe(@"[自检] 第 %d 轮挂钩完成：已启用=%d 伪密码已配置=%d",
                 gDLBootRounds, DLEnabled(), DLDecoyPasscode().length > 0);

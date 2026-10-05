@@ -5,7 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <unistd.h>
 
-#define DL_VERSION      @"0.1.10"
+#define DL_VERSION      @"0.1.11"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 
 // 共享配置目录（SpringBoard 进程与「设置」进程都能写的位置）
