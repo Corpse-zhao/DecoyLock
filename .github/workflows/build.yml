@@ -22,10 +22,15 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           git clone --recursive https://github.com/theos/theos.git $THEOS
-          mkdir -p $THEOS/sdks
-          cd $THEOS/sdks
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git .
+          # ⚠️ sdks 目录必须一次性建好：先 clone 到临时目录再 sparse-checkout，
+          #    不要 `cd $THEOS/sdks && git clone ... .`（目录已存在会 fatal 128）
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git $THEOS/sdks-tmp
+          cd $THEOS/sdks-tmp
           git sparse-checkout set iPhoneOS14.5.sdk
+          mv iPhoneOS14.5.sdk $THEOS/sdks/
+          rm -rf $THEOS/sdks-tmp
+          ls $THEOS/sdks/
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
