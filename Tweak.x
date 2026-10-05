@@ -400,6 +400,12 @@ static BOOL DLAttemptUnlockReplacement(id self, SEL _cmd, id passcode) {
 //    判据：`dladdr(class_getImageName(c))` 的路径必须落在 /System/Library
 //    或 /usr/lib（iOS 系统镜像），其余一律跳过。
 static void DLHookAllAttemptUnlock(void) {
+    // ⚠️ 幂等：重试时不能重置字典，否则先前挂上的 orig 丢失
+    //    → 转发时查不到原 IMP → 行为被改写。只挂一次。
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
     gDLOrigIMPs = [NSMutableDictionary dictionary];
     gDLHookedClasses = [NSMutableArray array];
 
@@ -463,36 +469,65 @@ static void DLHookAllAttemptUnlock(void) {
                 [gDLHookedClasses componentsJoinedByString:@", "]);
     }
 }
-
 // ===========================================================================
-// Hook 组 C2：侦查挂钩（v0.1.7 新增）
+// Hook 组 C2：侦查挂钩（v0.1.7）
 //
 // ⭐ 背景：v0.1.6 实测证明「输入捕获已工作」（entry.append 命中），
 //    但输完密码后没有任何 [判定] 日志 —— 说明我们挂上的
 //    attemptUnlockWithPasscode:（单参数）【不在 iOS 16.6 的验证路径上】。
 //    真正的验证方法名未知 → 不猜，让日志告诉我们。
 //
-//    做法：对「嫌疑类」的全部实例方法做**方法名筛选挂钩**：
-//      筛 lowercase 含 unlock / passcode / verify / auth / credential 的方法，
-//      用 MSHookMessageEx 挂上通用记录函数 —— 输入后 20 秒内（侦查窗口）
-//      每次被调用都打一行日志。用户再输一次伪密码，真凶直接现形。
+//    做法：对「嫌疑类」的**白名单方法**做挂钩，
+//      输入后 20 秒内（侦查窗口）每次被调用都打一行日志。
+//      用户再输一次伪密码，真凶直接现形。
 //
-//    嫌疑类来源：
-//      ① SBLockScreenManager（已知存在，lockUIFromSource: 已证实 hook 生效）
-//      ② 密码框的 delegate 类（输完密码后 field 一定回调 delegate，
-//         delegate 才是「验证发起者」—— 运行时取，零猜测）
+// ===========================================================================
+// ⛔⛔ v0.1.7 翻车记录（用户实测：锁屏就进安全模式）—— 三个致命错误
+// ===========================================================================
 //
-//    通用替换函数的可行性（arm64）：
-//      - ObjC 方法参数走 x0-x7 寄存器，前两个固定 self/_cmd；
-//        我们不 deref 参数只转发，指针/整数（含 BOOL/int）都安全。
-//        float/double/struct 参数会坏 → 按 type encoding 跳过这些方法。
-//      - 按返回值分两组：void 用 V 系列，其他用 I 系列
-//        （I 系列返回 id，BOOL 返回的低位截断自然兼容）。
+//  ❌ 错误 1：**按方法名子串筛选挂钩 = 会挂到签名不兼容的方法上**
+//     上一版筛 `lowercase 含 unlock/passcode/verify/auth/credential`，
+//     然后再按「返回值 void/id × 参数 0~3」挑转发函数。这有个致命漏洞：
+//     **参数类型不是只有 id**。比如挂上 `-（void)setAuthContext:(BOOL)x`，
+//     x 走的是 w0 寄存器（32 位），我们的转发函数把它当 id（64 位指针）
+//     读到 x1 —— **一旦原实现里要解引用这个"指针"，立刻野指针崩溃**。
+//     同理 float/double 参数走 s0/d0，通用转发会把垃圾传进去。
+//     → 修法：**只挂钩显式白名单里的方法名**（精确字符串相等），
+//       并且**逐个校验 type encoding**（见下）。
+//
+//  ❌ 错误 2：**白名单外的调用也一律进转发函数，任何异常都直接崩 SpringBoard**
+//     上一版转发函数体里没有 @try/@catch，一旦内部出问题（查表、打日志、
+//     原 IMP 转发）就是 SpringBoard 直接挂 → 安全模式。
+//     → 修法：**每个转发函数第一行就包 @try**，catch 里**无条件转原 IMP**；
+//       连打日志都单独包一层（磁盘 IO 失败绝不能影响系统）。
+//
+//  ❌ 错误 3：**原 IMP 查不到时"保守返回"**（上一版返回 NO/nil）
+//     `attemptUnlock` 返回 NO 是"解锁失败"，`unlockUI...` 返回 nil 可能被
+//     上层拿去用 → 行为被改写。而且查表用的是 `[self class]`，
+//     子类实例走父类 IMP 时会查空。
+//     → 修法：**查不到就沿继承链找；实在找不到就什么都不做直接返回**
+//       （void 方法 return，id 方法 return nil，但绝不主动改写语义）。
+//
+// ===========================================================================
+// v0.1.8 的侦查策略（保守版，只观察不改写）
+// ===========================================================================
+//
+//  ① 只挂钩**显式白名单**里的方法名（字符串精确相等，不做子串匹配）
+//  ② 每个待挂方法都要过 `DLReconSignatureOK()`：返回值必须是 void 或 id，
+//     参数必须**全是对象类型**（@、# 也算指针，安全）；出现 BOOL/int/float/
+//     struct 等一律跳过 —— 宁可不侦查，也不能崩
+//  ③ 嫌疑类仍从「零猜测」来源取：SBLockScreenManager + 密码框 delegate
+//  ④ **不再吞掉任何调用**。侦查阶段只记录，验证路径完全交给系统原生逻辑
+//     （命中伪密码的劫持由 Hook 组 A 的输入缓冲 + Hook 组 C 的
+//       attemptUnlockWithPasscode: 承担，不靠侦查挂钩）
+//  ⑤ 日志写入每 0.5 秒最多一次（限流），避免文件 IO 把主线程拖崩
 // ===========================================================================
 
 static CFAbsoluteTime gDLReconUntil = 0.0;          // 侦查窗口截止时间
 static NSMutableArray<NSString *> *gDLReconClasses = nil;   // 已侦查挂钩的类
 static NSMutableDictionary<NSString *, NSValue *> *gDLReconOrig = nil; // 原始 IMP
+static CFAbsoluteTime gDLReconLastLog = 0.0;        // 日志限流
+static int gDLReconLogCount = 0;                    // 本次窗口已记录条数
 
 static void DLReconOpenWindow(void) {
     gDLReconUntil = CFAbsoluteTimeGetCurrent() + 20.0;
@@ -502,174 +537,258 @@ static BOOL DLReconInWindow(void) {
     return CFAbsoluteTimeGetCurrent() < gDLReconUntil;
 }
 
-// 查原始 IMP：先按「实际类+selector」查，找不到沿继承链向上（继承场景）
+// 查原始 IMP：先按「类名+selector」查，找不到沿继承链向上
+// ⚠️ 用 object_getClass(self) 而不是 [self class] —— 后者在 KVO 动态子类
+//    场景下会拿到假的类名，查不到表。
 static id DLReconOrigLookup(id self, SEL _cmd) {
-    NSString *key = [NSStringFromClass([self class])
-                     stringByAppendingString:NSStringFromSelector(_cmd)];
-    NSValue *boxed = gDLReconOrig[key];
-    Class c = class_getSuperclass([self class]);
-    while (c && !boxed) {
-        boxed = gDLReconOrig[[NSStringFromClass(c)
-                              stringByAppendingString:NSStringFromSelector(_cmd)]];
-        c = class_getSuperclass(c);
-    }
-    return boxed;
+    @try {
+        Class c = object_getClass(self);
+        SEL s = _cmd;
+        int guard = 0;
+        while (c && guard++ < 24) {
+            NSString *key = [NSStringFromClass(c)
+                             stringByAppendingString:NSStringFromSelector(s)];
+            NSValue *boxed = gDLReconOrig[key];
+            if (boxed) return boxed;
+            c = class_getSuperclass(c);
+        }
+    } @catch (__unused NSException *e) { }
+    return nil;
 }
 
+// ⭐ 日志：整体 @try + 限流。磁盘 IO 失败绝不能影响 SpringBoard。
 static void DLReconLog(id self, SEL _cmd) {
-    if (!DLReconInWindow()) return;
-    DLProbe(@"[侦查] ★ %@ -%@ 被调用（输入后！）",
-            NSStringFromClass([self class]), NSStringFromSelector(_cmd));
+    @try {
+        if (!DLReconInWindow()) return;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - gDLReconLastLog < 0.5) return;    // 限流：2 条/秒
+        gDLReconLastLog = now;
+        if (gDLReconLogCount++ > 400) return;       // 单次窗口封顶
+        DLProbe(@"[侦查] %@ -%@",
+                NSStringFromClass(object_getClass(self)),
+                NSStringFromSelector(_cmd));
+    } @catch (__unused NSException *e) { }
 }
 
-// 侦查中命中伪密码 → 吞掉「发起解锁」语义的方法（其余只记录）
-static BOOL DLReconSwallow(id self, SEL _cmd) {
-    NSString *sel = NSStringFromSelector(_cmd);
-    if ([sel hasPrefix:@"attemptUnlock"] ||
-        [sel hasPrefix:@"unlockUI"] ||
-        [sel hasPrefix:@"unlockWithIntent"] ||
-        [sel hasPrefix:@"unlockDevice"]) {
-        return DLShouldHijackUnlock(
-            [NSString stringWithFormat:@"recon.%@", sel]);
-    }
-    return NO;
-}
+// ---- 4 个通用转发函数（仅「返回 void / 参数全是对象」的方法会用到）----
+// ⭐ 每个函数体整体包 @try；catch 里无条件转原 IMP。
+//    不吞任何调用 —— 侦查阶段只观察，不改写系统行为。
 
-// ---- 8 个通用替换函数（void/id × 0~3 参）----
 static void DLReconV0(id self, SEL _cmd) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) ((void (*)(id, SEL))[b pointerValue])(self, _cmd);
 }
 static void DLReconV1(id self, SEL _cmd, id a) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) ((void (*)(id, SEL, id))[b pointerValue])(self, _cmd, a);
 }
 static void DLReconV2(id self, SEL _cmd, id a, id b2) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) ((void (*)(id, SEL, id, id))[b pointerValue])(self, _cmd, a, b2);
 }
 static void DLReconV3(id self, SEL _cmd, id a, id b2, id c2) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) ((void (*)(id, SEL, id, id, id))[b pointerValue])(self, _cmd, a, b2, c2);
 }
+
 static id DLReconI0(id self, SEL _cmd) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return nil;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) return ((id (*)(id, SEL))[b pointerValue])(self, _cmd);
     return nil;
 }
 static id DLReconI1(id self, SEL _cmd, id a) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return nil;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) return ((id (*)(id, SEL, id))[b pointerValue])(self, _cmd, a);
     return nil;
 }
 static id DLReconI2(id self, SEL _cmd, id a, id b2) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return nil;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) return ((id (*)(id, SEL, id, id))[b pointerValue])(self, _cmd, a, b2);
     return nil;
 }
 static id DLReconI3(id self, SEL _cmd, id a, id b2, id c2) {
     DLReconLog(self, _cmd);
-    if (DLReconSwallow(self, _cmd)) return nil;
     id b = DLReconOrigLookup(self, _cmd);
     if (b) return ((id (*)(id, SEL, id, id, id))[b pointerValue])(self, _cmd, a, b2, c2);
     return nil;
 }
 
+// ---------------------------------------------------------------------------
+// ⭐ 签名校验：决定这个方法能不能被「通用转发」安全挂钩
+//
+//   ObjC 方法返回/参数的 type encoding 首字符：
+//     @  对象        → 指针，安全
+//     #  类对象      → 指针，安全
+//     :  selector    → 指针，安全
+//     ^  指针        → 指针，安全
+//     c/C/i/I/s/S/l/L/q/Q → 整数（BOOL 是 c 或 B）→ **不安全**（窄于 64 位，
+//                          通用转发按 64 位读会读到垃圾/越界）
+//     f/d            → 浮点（走 s0/d0 寄存器）→ **不安全**
+//     { ( [          → struct/union/array → **不安全**
+//     v              → void 返回，安全（返回值不用管）
+//     ?              → 未知，跳过
+// ---------------------------------------------------------------------------
+static BOOL DLReconTypeIsSafePointer(const char *t) {
+    if (!t || !t[0]) return NO;
+    switch (t[0]) {
+        case '@': case '#': case ':': case '^': return YES;
+        default: return NO;
+    }
+}
+
+static BOOL DLReconSignatureOK(Method m, BOOL *outIsVoid, unsigned int *outNArgs) {
+    char *ret = method_copyReturnType(m);
+    BOOL retVoid = (ret && ret[0] == 'v');
+    BOOL retSafe = retVoid || DLReconTypeIsSafePointer(ret);
+    free(ret);
+    if (!retSafe) return NO;
+
+    unsigned int total = method_getNumberOfArguments(m);
+    if (total < 2) return NO;
+    unsigned int n = total - 2;
+    if (n > 3) return NO;
+
+    // 逐个参数检查：必须全是「指针类」编码
+    for (unsigned int i = 2; i < total; i++) {
+        char *at = method_copyArgumentType(m, i);
+        BOOL safe = DLReconTypeIsSafePointer(at);
+        free(at);
+        if (!safe) return NO;
+    }
+    *outIsVoid = retVoid;
+    *outNArgs = n;
+    return YES;
+}
+
+// ---------------------------------------------------------------------------
+// ⭐ 白名单：只挂钩这些方法名（字符串精确相等）
+//
+//    宁可不侦查，也不能崩。子串匹配（含 unlock/passcode/...）已被证明会
+//    挂到签名不兼容的方法上（v0.1.7 锁屏进安全模式的根因之一）。
+// ---------------------------------------------------------------------------
+static NSArray<NSString *> *DLReconWhiteList(void) {
+    static NSArray<NSString *> *w = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        w = @[
+            // —— 密码校验类 ——
+            @"verifyPasscode:", @"verifyPasscode:forUser:", @"verifyPasscode:options:",
+            @"verifyPassword:", @"verifyPassword:forUser:",
+            @"checkPasscode:", @"checkPassword:",
+            @"isPasscodeCorrect:", @"isPasswordCorrect:",
+            @"validatePasscode:", @"validatePassword:",
+            @"authenticateWithPasscode:", @"authenticateWithPassword:",
+            @"authenticateWithOptions:",
+            @"attemptUnlockWithPasscode:",
+            @"attemptUnlockWithPasscode:forUser:",
+            @"passcodeEntryFieldDidSucceed:",
+            @"passcodeEntryField:didEnterPasscode:",
+            @"passcodeEntryFieldDidCancelEntry:",
+            @"passcodeEntryFieldDidBeginEntry:",
+            @"didEnterPasscode:", @"didEnterPassword:",
+            @"submitPasscode:", @"submitPassword:",
+            // —— 解锁动作类 ——
+            @"unlockWithIntent:", @"unlockUIFromSource:withOptions:",
+            @"unlockDevice:", @"unlockDeviceWithIntent:",
+            @"attemptUnlockForReason:",
+            // —— 提示/失败回调（用于确认真凶路径）——
+            @"notePasscodeEntryFailed", @"notePasscodeEntryCannotAttempt:",
+            @"noteIncorrectPasscodeWithCompletion:",
+            @"showPasscodeFailure", @"passcodeEntryDidFail",
+        ];
+    });
+    return w;
+}
+
 // 对一个类做侦查挂钩（幂等：同一类只挂一次）
 static void DLReconClass(Class c, NSString *reason) {
-    if (!c || !DLIsSpringBoard()) return;
-    NSString *cn = NSStringFromClass(c);
-    if (!cn.length || [cn hasPrefix:@"_"]) return;
+    @try {
+        if (!c || !DLIsSpringBoard()) return;
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length || [cn hasPrefix:@"_"]) return;
+        // ⭐ 只认系统镜像 —— 绝不碰第三方框架
+        const char *image = class_getImageName(c);
+        if (!image) return;
+        NSString *imgPath = [NSString stringWithUTF8String:image];
+        if (![imgPath hasPrefix:@"/System/Library/"] &&
+            ![imgPath hasPrefix:@"/usr/lib/"]) return;
 
-    if (!gDLReconClasses) {
-        gDLReconClasses = [NSMutableArray array];
-        gDLReconOrig = [NSMutableDictionary dictionary];
-    }
-    if ([gDLReconClasses containsObject:cn]) return;
-    [gDLReconClasses addObject:cn];
-
-    unsigned int mc = 0;
-    Method *ms = class_copyMethodList(c, &mc);
-    int hooked = 0, skipped = 0;
-    for (unsigned int i = 0; i < mc; i++) {
-        SEL m = method_getName(ms[i]);
-        NSString *selName = NSStringFromSelector(m);
-        NSString *low = [selName lowercaseString];
-
-        BOOL interesting = [low containsString:@"unlock"] ||
-                           [low containsString:@"passcode"] ||
-                           [low containsString:@"verify"] ||
-                           [low containsString:@"auth"] ||
-                           [low containsString:@"credential"];
-        if (!interesting) continue;
-        // attemptUnlockWithPasscode: 已有专门挂钩（Hook 组 C），避免双层
-        if ([low hasPrefix:@"attemptunlockwithpasscode"]) continue;
-
-        // struct 返回的方法跳过（通用转发会破坏 ABI）
-        char *rt = method_copyReturnType(ms[i]);
-        BOOL isStruct = rt && rt[0] == '{';
-        free(rt);
-        if (isStruct) { skipped++; continue; }
-
-        unsigned int nargs = method_getNumberOfArguments(ms[i]) - 2;
-        if (nargs > 3) { skipped++; continue; }
-
-        char *retT = method_copyReturnType(ms[i]);
-        BOOL isVoid = retT && strcmp(retT, "v") == 0;
-        free(retT);
-
-        IMP repl;
-        if (isVoid) {
-            if (nargs == 0)      repl = (IMP)DLReconV0;
-            else if (nargs == 1) repl = (IMP)DLReconV1;
-            else if (nargs == 2) repl = (IMP)DLReconV2;
-            else                 repl = (IMP)DLReconV3;
-        } else {
-            if (nargs == 0)      repl = (IMP)DLReconI0;
-            else if (nargs == 1) repl = (IMP)DLReconI1;
-            else if (nargs == 2) repl = (IMP)DLReconI2;
-            else                 repl = (IMP)DLReconI3;
+        if (!gDLReconClasses) {
+            gDLReconClasses = [NSMutableArray array];
+            gDLReconOrig = [NSMutableDictionary dictionary];
         }
+        if ([gDLReconClasses containsObject:cn]) return;
+        [gDLReconClasses addObject:cn];
 
-        IMP old = NULL;
-        MSHookMessageEx(c, m, repl, &old);
-        if (old) {
-            gDLReconOrig[[cn stringByAppendingString:selName]] =
-                [NSValue valueWithPointer:(void *)old];
+        NSArray *wl = DLReconWhiteList();
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        int hooked = 0, skipped = 0;
+        for (unsigned int i = 0; i < mc; i++) {
+            NSString *selName = NSStringFromSelector(method_getName(ms[i]));
+
+            // ① 白名单精确匹配
+            if (![wl containsObject:selName]) continue;
+
+            // ② 签名校验（返回值 + 参数类型）
+            BOOL isVoid = NO;
+            unsigned int nargs = 0;
+            if (!DLReconSignatureOK(ms[i], &isVoid, &nargs)) {
+                skipped++;
+                continue;
+            }
+
+            // ③ 挑转发函数
+            IMP repl;
+            if (isVoid) {
+                if (nargs == 0)      repl = (IMP)DLReconV0;
+                else if (nargs == 1) repl = (IMP)DLReconV1;
+                else if (nargs == 2) repl = (IMP)DLReconV2;
+                else                 repl = (IMP)DLReconV3;
+            } else {
+                if (nargs == 0)      repl = (IMP)DLReconI0;
+                else if (nargs == 1) repl = (IMP)DLReconI1;
+                else if (nargs == 2) repl = (IMP)DLReconI2;
+                else                 repl = (IMP)DLReconI3;
+            }
+
+            IMP old = NULL;
+            MSHookMessageEx(c, method_getName(ms[i]), repl, &old);
+            if (old) {
+                gDLReconOrig[[cn stringByAppendingString:selName]] =
+                    [NSValue valueWithPointer:(void *)old];
+                hooked++;
+                DLProbe(@"[侦查挂] %@ -%@（%u参，%@）", cn, selName, nargs,
+                        isVoid ? @"void" : @"id");
+            } else {
+                skipped++;
+            }
         }
-        hooked++;
-        DLProbe(@"[侦查挂] %@ -%@（%u参，%s）", cn, selName, nargs,
-                isVoid ? "void" : "ret");
-    }
-    if (ms) free(ms);
-    DLProbe(@"[侦查挂] %@（%@）：挂 %d 个，跳过 %d 个",
-            cn, reason ?: @"?", hooked, skipped);
+        if (ms) free(ms);
+        DLProbe(@"[侦查挂] %@（%@）：挂 %d 个，跳过 %d 个",
+                cn, reason ?: @"?", hooked, skipped);
+    } @catch (__unused NSException *e) { }
 }
 
 // 密码框的 delegate 才是「验证发起者」—— 运行时取它的类来侦查，零猜测
 static void DLEnsureReconForPasscodeField(id field) {
-    if (!field || !DLIsSpringBoard()) return;
-    if (![field respondsToSelector:@selector(delegate)]) return;
+    @try {
+        if (!field || !DLIsSpringBoard()) return;
+        if (![field respondsToSelector:@selector(delegate)]) return;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    id dlg = [field performSelector:@selector(delegate)];
+        id dlg = [field performSelector:@selector(delegate)];
 #pragma clang diagnostic pop
-    if (!dlg) return;
-    DLReconClass([dlg class], @"delegate");
+        if (!dlg) return;
+        DLReconClass([dlg class], @"delegate");
+    } @catch (__unused NSException *e) { }
 }
 
 // ===========================================================================
@@ -697,7 +816,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.7 侦查版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.8 稳定侦查版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -728,26 +847,51 @@ static void DLDumpEnvironment(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 启动时的挂钩编排：跑一轮，失败/挂空则退避重试
+//
+// ⚠️ 为什么需要重试：SpringBoard 起来时锁屏类可能还没注册完，
+//    一次性挂在空类上就永远没机会了（v0.1.5 的教训）。
+//    10 次 × 递增退避（2,4,6,...,20 秒），足够覆盖锁屏加载窗口。
+// ---------------------------------------------------------------------------
+static int gDLBootRounds = 0;
+
+static void DLBootRound(void) {
+    @try {
+        if (!DLIsSpringBoard()) return;
+        gDLBootRounds++;
+
+        if (gDLBootRounds == 1) {
+            DLHookAllAttemptUnlock();
+        }
+
+        // 侦查挂钩：对嫌疑类挂钩，日志会告诉我们真实的密码验证方法名
+        Class sm = NSClassFromString(@"SBLockScreenManager");
+        if (sm) DLReconClass(sm, @"启动侦查");
+
+        DLProbe(@"[自检] 第 %d 轮挂钩完成：已启用=%d 伪密码已配置=%d",
+                gDLBootRounds, DLEnabled(), DLDecoyPasscode().length > 0);
+
+        // 还没到上限就安排下一轮（幂等，重复调用无副作用）
+        if (gDLBootRounds < 10) {
+            double delay = 2.0 * (gDLBootRounds + 1);   // 4,6,8,...,20 秒
+            if (delay > 20.0) delay = 20.0;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                dispatch_get_main_queue(), ^{ DLBootRound(); });
+        }
+    } @catch (__unused NSException *e) { }
+}
+
 %ctor {
     @autoreleasepool {
         if (DLIsSpringBoard()) {
             DLDumpEnvironment();
 
-            // ⭐ 关键：枚举所有类，挂钩 attemptUnlockWithPasscode:
-            //    必须在 springboard 起来之后、用户解锁之前完成。
-            //    构造器阶段 SpringBoard 的锁屏类可能还没注册，
-            //    所以延后 3 秒再挂一次（挂不上就说明系统不用这个方法，
-            //    此时依赖密码框捕获 + yield 兜底，不会锁死设备）。
+            // 首次侦查：构造器阶段先挂一遍（多数情况锁屏类已注册）
+            // 之后由 DLBootRound 自己按退避节奏重试
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                DLHookAllAttemptUnlock();
-                // ⭐ 侦查挂钩：对锁屏管理器做方法名筛选挂钩，
-                //    日志会告诉我们 iOS 16.6 真正的密码验证方法名
-                Class sm = NSClassFromString(@"SBLockScreenManager");
-                if (sm) DLReconClass(sm, @"启动侦查");
-                DLProbe(@"[自检] 3 秒后复读配置：已启用=%d 伪密码已配置=%d",
-                        DLEnabled(), DLDecoyPasscode().length > 0);
-            });
+                           dispatch_get_main_queue(), ^{ DLBootRound(); });
         }
     }
 }

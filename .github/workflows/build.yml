@@ -44,10 +44,11 @@ jobs:
           gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
           ls -la packages/
 
-      - name: Preflight — 静态自检（拦下「编译过了但钩子是空的」）
+      - name: Preflight — 静态自检（拦下「编译过了但钩子是空的 / 会崩的」）
         run: |
-          # 这几条专门拦 v0.1.5 那类错误：Logos 对不存在的类/方法**不报错**，
-          # 所以 CI 全绿、装上也毫无反应。必须在编译前静态拦。
+          # 这些检查专门拦两类错误：
+          #   ① Logos 对不存在的类/方法**不报错** → CI 全绿、装上也毫无反应
+          #   ② 通用转发挂钩不做签名校验 → 挂到非对象参数方法上 → 锁屏进安全模式
           FAIL=0
 
           echo "--- 检查 1：%hook UIResponder 上的输入方法（%orig 会跳 NULL） ---"
@@ -92,9 +93,39 @@ jobs:
             FAIL=1
           fi
 
+          echo "--- 检查 5：⭐ 通用转发挂钩必须做签名校验（v0.1.7 锁屏进安全模式的根因） ---"
+          # 教训：按「方法名子串」筛选 + 通用转发 = 会挂到签名不兼容的方法上。
+          # 例如把 BOOL 参数当 id（64 位指针）转发，原实现一解引用就崩。
+          # 必须：① 只挂显式白名单（精确匹配）；② 用 method_copyArgumentType
+          #        逐个校验参数编码；③ 转发函数体内包 @try。
+          if grep -nE 'containsString:@"(unlock|passcode|verify|auth|credential)"' Tweak.x \
+               | grep -vE '^\s*[0-9]+:\s*//'; then
+            echo "❌ 检测到「方法名子串筛选挂钩」（containsString:@\"unlock\" 之类）。"
+            echo "   这会把签名不兼容的方法也挂上 → 通用转发读错参数 → SpringBoard 崩溃。"
+            echo "   必须改为：显式白名单精确匹配 + method_copyArgumentType 签名校验。"
+            FAIL=1
+          fi
+          if grep -qE 'DLReconSignatureOK|method_copyArgumentType' Tweak.x; then
+            echo "✅ 通用转发挂钩已带签名校验（DLReconSignatureOK / method_copyArgumentType）"
+          else
+            if grep -qE 'DLReconV[0-3]|DLReconI[0-3]' Tweak.x; then
+              echo "❌ 用了通用转发函数（DLReconV0..3 / I0..3）但没有签名校验 → 高概率崩溃"
+              FAIL=1
+            fi
+          fi
+          echo "--- 检查 6：通用转发函数体必须包 @try ---"
+          if grep -qE 'static void DLReconV1' Tweak.x; then
+            if grep -A 6 'static void DLReconV1' Tweak.x | grep -qE '@try|DLReconLog\('; then
+              echo "✅ 转发函数走 DLReconLog（内部已包 @try）"
+            else
+              echo "❌ 转发函数体未见 @try 保护 → 一次异常就是 SpringBoard 挂"
+              FAIL=1
+            fi
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
-            echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应」的包）"
+            echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"
             exit 1
           fi
           echo "✅ 静态自检通过"
