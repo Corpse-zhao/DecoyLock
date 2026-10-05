@@ -37,7 +37,7 @@ jobs:
       - name: Build package
         run: |
           export THEOS=$HOME/theos
-          gmake package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 2>&1 | tail -60
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 2>&1 | tail -60
 
       - name: Inspect package contents
         run: |
