@@ -87,12 +87,6 @@ static NSArray *DLDefaultSelection(void) {
 @property (nonatomic, strong) NSMutableSet *selected;
 @end
 
-@interface DLTextEditController : PSListController
-@property (nonatomic, copy) NSString *cfgKey;
-@property (nonatomic, copy) NSString *cfgTitle;
-@property (nonatomic, assign) BOOL numericOnly;
-@end
-
 #pragma mark - 主面板
 
 @implementation DLRootListController
@@ -294,7 +288,7 @@ static NSArray *DLDefaultSelection(void) {
     if ([self.selected containsObject:ident]) [self.selected removeObject:ident];
     else                                      [self.selected addObject:ident];
 
-    [tv reloadRowsAtIndexPaths:@[ip] withAnimation:UITableViewRowAnimationNone];
+    [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
 }
 
 @end
