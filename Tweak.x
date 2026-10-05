@@ -948,31 +948,16 @@ static void DLEnsureReconForPasscodeField(id field) {
 }
 
 // ===========================================================================
-// Hook 组 D：锁屏生命周期 —— 锁屏出现/消失时清空缓冲，避免串门
+// Hook 组 D：锁屏生命周期 —— 已合并进 v0.1.13 的 SBLockScreenManager 钩子块
+// （Logos 同一个类只能有一个 %hook 块，否则重复挂钩/行为不可预期）
 // ===========================================================================
-
-@interface SBLockScreenManager : NSObject
-@end
-
-%hook SBLockScreenManager
-- (void)lockUIFromSource:(int)source withOptions:(id)options {
-    DLResetInput();
-    DLProbe(@"锁屏出现 → 清空输入缓冲");
-    %orig;
-}
-- (void)noteLockScreenUIDidDisappear {
-    // 进真桌面时清掉一切痕迹（避免下次锁屏被上次输入污染）
-    DLResetInput();
-    %orig;
-}
-%end
 
 // ===========================================================================
 // 启动
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.12 CoverSheet侦查版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.13 解锁请求挂钩版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1080,6 +1065,104 @@ static void DLLogInputCapture(NSString *src) {
                 (unsigned long)len, src);
     }
 }
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.13：真正的解锁请求路径 —— 直接挂实测暴露的方法名
+//
+// v0.1.12 日志把 `SBLockScreenManager` 的**方法清单**全打出来了，里面有：
+//   attemptUnlockWithPasscode:(1参,void)                       ← 我一直在挂的（从不被调用）
+//   coverSheetViewControllerHandleUnlockAttemptSucceeded:(1参,void)  ← 解锁**成功**回调
+//   coverSheetViewController:unlockWithRequest:completion:(3参,void) ← ⭐ 带 request 的解锁
+//   coverSheetPresentationManager:unlockWithRequest:completion:(3参,void)
+//
+// 关键洞察：
+//   ① `HandleUnlockAttemptSucceeded:` 是**成功**回调 → 那一定有个「尝试」的入口
+//   ② `unlockWithRequest:completion:` 里的 **Request** 才是 CoverSheet 架构的真实载体
+//      —— 它的第 1 个参数就是请求对象（很可能携带密码/验证结果）
+//   ③ 我一路猜的 `attemptUnlockWithPasscode:` 从不被调用 → 别再把宝押在它身上
+//
+// 本组做法：对这几个方法做**精确挂钩**，并从 `request` 对象上
+//   用 KVC 尽力捞密码（`_passcode` / `passcode` / `credential` / `_credential`）
+//   —— 只观察、只记录，**不改写任何行为**。
+// ---------------------------------------------------------------------------
+
+@interface SBLockScreenManager : NSObject
+@end
+
+%hook SBLockScreenManager
+
+// —— 锁屏生命周期（原 Hook 组 D，v0.1.13 并入本块）——
+- (void)lockUIFromSource:(int)source withOptions:(id)options {
+    DLResetInput();
+    DLProbe(@"锁屏出现 → 清空输入缓冲");
+    %orig;
+}
+- (void)noteLockScreenUIDidDisappear {
+    // 进真桌面时清掉一切痕迹（避免下次锁屏被上次输入污染）
+    DLResetInput();
+    %orig;
+}
+
+// ⭐ 核心：带 request 的解锁。request 很可能就是密码载体
+- (void)coverSheetViewController:(id)vc
+                unlockWithRequest:(id)request
+                       completion:(id)completion {
+    DLProbe(@"[解锁请求] coverSheetViewController:unlockWithRequest:completion: 被调用 "
+            @"request=%@", request);
+    if (request) {
+        // 只读 KVC 探测（任何异常都吞掉，绝不影响系统）
+        @try {
+            NSArray *keys = @[@"passcode", @"_passcode", @"password", @"_password",
+                              @"credential", @"_credential", @"passcodeString",
+                              @"_passcodeString", @"requestType", @"type", @"source"];
+            NSMutableString *dump = [NSMutableString string];
+            for (NSString *k in keys) {
+                @try {
+                    id v = [request valueForKey:k];
+                    if (v) [dump appendFormat:@"%@=%@ ", k, v];
+                } @catch (__unused NSException *e) { }
+            }
+            DLProbe(@"[解锁请求] request KVC 探测：%@",
+                    dump.length ? dump : @"(无可用键)");
+        } @catch (__unused NSException *e) { }
+    }
+    %orig;
+}
+
+- (void)coverSheetPresentationManager:(id)mgr
+                    unlockWithRequest:(id)request
+                           completion:(id)completion {
+    DLProbe(@"[解锁请求] coverSheetPresentationManager:unlockWithRequest:completion: 被调用 "
+            @"request=%@", request);
+    %orig;
+}
+
+// 解锁**成功**回调 —— 出现它说明系统认可了这次解锁
+- (void)coverSheetViewControllerHandleUnlockAttemptSucceeded:(id)vc {
+    DLProbe(@"[解锁请求] ★★ HandleUnlockAttemptSucceeded 被调用（系统认可解锁）");
+    %orig;
+}
+
+// 保留：老的判定点（若某些系统版本真的走它，仍能生效）
+- (void)attemptUnlockWithPasscode:(id)passcode {
+    DLProbe(@"[解锁请求] attemptUnlockWithPasscode: 被调用 passcode=%@", passcode);
+    %orig;
+}
+
+%end
+
+// ---------------------------------------------------------------------------
+// ⭐ v0.1.13：失败回调 —— 用于确认「验证判定发生在这个方法之前」
+// ---------------------------------------------------------------------------
+@interface SBUIPasscodeLockViewBase : UIView
+@end
+
+%hook SBUIPasscodeLockViewBase
+- (void)resetForFailedPasscode {
+    DLProbe(@"[失败回调] ★ resetForFailedPasscode 被调用 → 系统判定密码错误");
+    %orig;
+}
+%end
 
 // ---------------------------------------------------------------------------
 // 启动时的挂钩编排：跑一轮，失败/挂空则退避重试
