@@ -1,7 +1,10 @@
 {
-    bundle = "DecoyLockPrefs";
-    isController = true;
-    entryControllerClass = "DLRootListController";
-    label = "伪锁屏";
-    icon = "icon.png";
+    entry = {
+        bundle = "DecoyLockPrefs";
+        cell = "PSLinkCell";
+        detail = "DLRootListController";
+        icon = "icon.png";
+        isController = true;
+        label = "伪锁屏";
+    };
 }
