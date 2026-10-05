@@ -656,7 +656,7 @@ static void DLReconClass(Class c, NSString *reason) {
                 isVoid ? "void" : "ret");
     }
     if (ms) free(ms);
-    DLProbe(@"[侦查挂] %@（%s）：挂 %d 个，跳过 %d 个",
+    DLProbe(@"[侦查挂] %@（%@）：挂 %d 个，跳过 %d 个",
             cn, reason ?: @"?", hooked, skipped);
 }
 
