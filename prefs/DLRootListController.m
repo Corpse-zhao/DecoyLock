@@ -69,7 +69,6 @@ static NSArray *DLFakeApps(void) {
 #pragma mark - 前向声明（类扩展须写在所有实现之前）
 
 @interface DLAppPickerController ()
-@property (nonatomic, strong) NSArray *apps;
 @property (nonatomic, strong) NSMutableSet *selected;
 @end
 
@@ -240,7 +239,7 @@ static NSArray *DLFakeApps(void) {
 
 - (void)save {
     NSMutableDictionary *cfg = DLPrefsLoad();
-    NSArray *ordered = [self.apps dlOrderWithSelection:self.selected];
+    NSArray *ordered = [DLFakeApps() dlOrderWithSelection:self.selected];
     cfg[@"decoy_apps"] = ordered;
     DLPrefsSave(cfg);
     [self.navigationController popViewControllerAnimated:YES];
@@ -302,10 +301,6 @@ static NSArray *DLFakeApps(void) {
     else                                     [self.selected addObject:ident];
 
     [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
-}
-
-- (NSArray *)apps {
-    return DLFakeApps();
 }
 
 @end
