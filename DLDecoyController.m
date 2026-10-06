@@ -35,6 +35,7 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 @interface DLDecoyAppCell : UICollectionViewCell
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *nameLabel;
+@property (nonatomic, copy)   NSString *appID;    // ⭐ v0.1.16：Dock 点击要认出是哪个 App
 - (void)configureWithApp:(NSDictionary *)app;
 @end
 
@@ -71,6 +72,7 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 - (void)configureWithApp:(NSDictionary *)app {
     NSString *icon = app[@"icon"] ?: @"app.fill";
     NSString *name = app[@"name"] ?: @"App";
+    self.appID = app[@"id"];          // ⭐ v0.1.16
     self.nameLabel.text = name;
 
     // 用 SF Symbol + 渐变底做「假图标」——零素材依赖
@@ -569,6 +571,12 @@ static BOOL sKeeperActive = NO;
 
     self.dock = dock;
     [self.view addSubview:dock];
+
+    // ⭐ v0.1.16：Dock 里的图标也能点（点中「退出 App」同样退出）
+    dock.userInteractionEnabled = YES;
+    UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
+                                  initWithTarget:self action:@selector(onDockTap:)];
+    [dock addGestureRecognizer:dt];
 }
 
 - (void)buildSecretExit {
@@ -667,17 +675,47 @@ static BOOL sKeeperActive = NO;
     [cv deselectItemAtIndexPath:ip animated:NO];
     if (ip.item >= (NSInteger)self.apps.count) return;
     NSDictionary *app = self.apps[ip.item];
-    DLProbe(@"decoy 点击假 App %@", app[@"name"]);
+    [self handleFakeAppTap:app[@"id"] name:app[@"name"]];
+}
 
-    // 假空间是空壳：弹一个仿系统的「无法打开」
+#pragma mark - ⭐ v0.1.16 统一的 App 点击处理（网格 + Dock 共用）
+
+// 规则：点「退出 App」→ 直接退出假空间；点其它 App → 仿系统的「无法打开」提示。
+- (void)handleFakeAppTap:(NSString *)appID name:(NSString *)name {
+    if (!appID.length) return;
+
+    NSString *exitID = DLDecoyExitApp();
+    DLProbe(@"decoy 点击假 App %@(%@) exitApp=%@",
+            name ?: @"?", appID, exitID.length ? exitID : @"(未设置)");
+
+    // ⭐ 点到了指定的「退出 App」→ 退出
+    if (exitID.length && [exitID isEqualToString:appID]) {
+        DLProbe(@"*** 点中退出 App（%@）→ 退出假空间", name ?: appID);
+        [DLDecoyController dismissDecoy];
+        return;
+    }
+
+    // 其它 App：假空间是空壳，弹一个仿系统的「无法打开」
     UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:app[@"name"]
+        alertControllerWithTitle:name ?: @"App"
                          message:@"此设备尚未启用该应用。"
                   preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"好"
                                           style:UIAlertActionStyleDefault
                                         handler:nil]];
     [self presentViewController:ac animated:YES completion:nil];
+}
+
+// Dock 点击：Dock 里的图标不是 collectionView cell，单独挂手势。
+// 用 hitTest 反查被点中的 DLDecoyAppCell（图标/文字都设了 userInteractionEnabled=NO，
+// 命中点必然落在 cell 本身）。
+- (void)onDockTap:(UITapGestureRecognizer *)g {
+    CGPoint p = [g locationInView:self.dock];
+    UIView *v = [self.dock hitTest:p withEvent:nil];
+    while (v && ![v isKindOfClass:[DLDecoyAppCell class]]) v = v.superview;
+    DLDecoyAppCell *cell = (DLDecoyAppCell *)v;
+    if (!cell) return;
+    [self handleFakeAppTap:cell.appID name:cell.nameLabel.text];
 }
 
 @end

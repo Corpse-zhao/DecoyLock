@@ -113,6 +113,8 @@ static NSArray *DLDefaultSelection(void) {
     if (!cfg[@"decoy_title"])  { cfg[@"decoy_title"] = @"我的 iPhone"; changed = YES; }
     if (!cfg[@"decoy_apps"])   { cfg[@"decoy_apps"] = DLDefaultSelection(); changed = YES; }
     if (!cfg[@"enabled"])      { cfg[@"enabled"] = @NO; changed = YES; }
+    // ⭐ v0.1.16：默认退出 App = 设置（插件端 DLDecoyExitApp() 默认值保持一致）
+    if (!cfg[@"decoy_exit_app"]) { cfg[@"decoy_exit_app"] = @"settings"; changed = YES; }
     if (changed) DLPrefsSave(cfg);
 }
 
@@ -248,6 +250,13 @@ static void DLDoRespring(void) {
     [self.navigationController pushViewController:vc animated:YES];
 }
 
+// ⭐ v0.1.16：退出 App 选择器
+- (void)pushExitAppPicker:(PSSpecifier *)spec {
+    DLExitAppPickerController *vc = [[DLExitAppPickerController alloc]
+        initWithStyle:UITableViewStyleInsetGrouped];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
 @end
 
 #pragma mark - 诊断日志查看器（自建，纯原生）
@@ -293,6 +302,19 @@ static void DLDoRespring(void) {
             : @"❌ 未设置（插件不生效！）"]];
     [lines addObject:[NSString stringWithFormat:@"假空间App: %@",
         [cfg[@"decoy_apps"] count] ? [cfg[@"decoy_apps"] componentsJoinedByString:@","] : @"(默认)"]];
+
+    // ⭐ v0.1.16：退出 App（用户反馈原隐藏退出太难，改点 App 退出）
+    NSString *exitID = cfg[@"decoy_exit_app"];
+    if (![exitID isKindOfClass:[NSString class]]) exitID = @"settings";
+    NSString *exitName = @"(未设置)";
+    if (exitID.length) {
+        for (NSDictionary *a in DLFakeApps()) {
+            if ([a[@"id"] isEqualToString:exitID]) { exitName = a[@"name"]; break; }
+        }
+        if (![exitName isEqualToString:@"(未设置)"]) exitName = [exitName stringByAppendingFormat:@"(%@)", exitID];
+    }
+    [lines addObject:[NSString stringWithFormat:@"退出App: %@", exitName]];
+
     [lines addObject:[NSString stringWithFormat:@"配置文件: %@", DLPrefsConfigPath()]];
     [lines addObject:[NSString stringWithFormat:@"文件存在: %@",
         [[NSFileManager defaultManager] fileExistsAtPath:DLPrefsConfigPath()] ? @"是" : @"否"]];
@@ -449,6 +471,99 @@ static void DLDoRespring(void) {
     else                                      [self.selected addObject:ident];
 
     [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+@end
+
+#pragma mark - ⭐ v0.1.16 退出 App 选择器（单选，点一下即保存并返回）
+// 背景：用户反馈「好难退出去」——原来的隐藏退出（标题连点 8 次 / 长按壁纸 3 秒）
+// 太难记住。改成在假空间里点指定 App 直接退出，这里选是哪个 App。
+//
+// ⚠️ 关键一步：保存时若该 App 不在「展示的 App」列表里，**自动加进去** ——
+//    否则用户选了「设置」但假空间里没显示设置，会以为功能坏了。
+
+@implementation DLExitAppPickerController
+
+- (NSArray *)rows {
+    NSMutableArray *r = [NSMutableArray array];
+    // 第 0 行 = 关闭该功能（只能用隐藏手势）
+    [r addObject:@{@"id": @"", @"name": @"不设置（仅用隐藏手势退出）"}];
+    for (NSDictionary *a in DLFakeApps()) {
+        [r addObject:@{@"id": a[@"id"], @"name": a[@"name"]}];
+    }
+    return r;
+}
+
+- (NSString *)currentExitID {
+    id v = DLPrefsLoad()[@"decoy_exit_app"];
+    if ([v isKindOfClass:[NSString class]]) return v;
+    return @"settings";      // 与插件端 DLDecoyExitApp() 的默认值保持一致
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"点哪个 App 退出";
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self.tableView reloadData];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return (NSInteger)[self rows].count;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return @"在假空间里点这个 App 即退出。点一下即保存（已自动勾选为显示）。";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *cellID = @"DLExitAppCell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cellID];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                      reuseIdentifier:cellID];
+    }
+    NSArray *rows = [self rows];
+    if (ip.row < 0 || ip.row >= (NSInteger)rows.count) return cell;
+
+    NSString *ident = rows[(NSUInteger)ip.row][@"id"];
+    cell.textLabel.text = rows[(NSUInteger)ip.row][@"name"];
+    cell.accessoryType = [ident isEqualToString:[self currentExitID]]
+        ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NSArray *rows = [self rows];
+    if (ip.row < 0 || ip.row >= (NSInteger)rows.count) return;
+
+    NSString *ident = rows[(NSUInteger)ip.row][@"id"];
+    NSMutableDictionary *cfg = DLPrefsLoad();
+    cfg[@"decoy_exit_app"] = ident;
+
+    // ⚠️ 自动把选中的 App 加进展示列表 —— 否则假空间里根本看不到它
+    if (ident.length) {
+        NSArray *cur = cfg[@"decoy_apps"];
+        if (![cur isKindOfClass:[NSArray class]] || !cur.count) cur = DLDefaultSelection();
+        if (![cur containsObject:ident]) {
+            NSMutableArray *ordered = [NSMutableArray array];
+            for (NSDictionary *a in DLFakeApps()) {
+                NSString *aid = a[@"id"];
+                if ([aid isEqualToString:ident] || [cur containsObject:aid]) {
+                    [ordered addObject:aid];
+                }
+            }
+            cfg[@"decoy_apps"] = ordered;
+        }
+    }
+
+    DLPrefsSave(cfg);
+    [self.navigationController popViewControllerAnimated:YES];
 }
 
 @end

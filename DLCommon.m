@@ -140,6 +140,16 @@ NSArray *DLDecoyApps(void) {
     return @[@"phone", @"message", @"camera", @"settings"];
 }
 
+// ⭐ v0.1.16：假空间里的「退出 App」
+// 用户反馈「好难退出去」（连点 8 次 / 长按 3 秒太隐蔽），改成点这个 App 直接退出。
+// 默认 "settings"（设置）—— 用户最可能记得住的入口。
+// 返回空串表示「不设置」，此时只能用隐藏手势退出。
+NSString *DLDecoyExitApp(void) {
+    id v = DLConfigGet(@"decoy_exit_app");
+    if ([v isKindOfClass:[NSString class]]) return v;   // 允许空串 = 明确关闭
+    return @"settings";
+}
+
 // ------------------------------ 探针 ------------------------------
 
 static NSString *DLTimestamp(void) {

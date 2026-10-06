@@ -51,8 +51,18 @@
         },
         {
             "cell": "PSGroupCell",
+            "label": "退出方式",
+            "footerText": "在假空间里点选定的这个 App 即可退出（默认「设置」）。若该 App 不在显示列表里，保存时会自动加入。"
+        },
+        {
+            "cell": "PSLinkCell",
+            "label": "点哪个 App 退出",
+            "action": "pushExitAppPicker:"
+        },
+        {
+            "cell": "PSGroupCell",
             "label": "退出与诊断",
-            "footerText": "假空间内的隐藏退出方式：在顶部标题处连点 8 次，或长按空白壁纸 3 秒。"
+            "footerText": "备用隐藏退出：在顶部标题处连点 8 次，或长按空白壁纸 3 秒。"
         },
         {
             "cell": "PSButtonCell",
@@ -72,7 +82,7 @@
         {
             "cell": "PSGroupCell",
             "label": "",
-            "footerText": "伪锁屏 v0.1.15 · 作者 板栗仁"
+            "footerText": "伪锁屏 v0.1.16 · 作者 板栗仁"
         }
     ]
 }

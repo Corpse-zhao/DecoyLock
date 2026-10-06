@@ -1,6 +1,6 @@
 Package: com.blr.decoylock
 Name: 伪锁屏
-Version: 0.1.15
+Version: 0.1.16
 Architecture: iphoneos-arm
 Description: 输入正确密码进真系统，输入伪密码进入可自定义的假空间。轻量版：假密码命中后不告知系统、直接呈现假锁屏界面。
 Maintainer: 板栗仁

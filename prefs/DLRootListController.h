@@ -34,6 +34,12 @@
 @interface DLAppPickerController : UITableViewController
 @end
 
+// ⭐ v0.1.16：退出 App 选择器（单选）。
+// 用户反馈「好难退出去」（连点 8 次 / 长按 3 秒太隐蔽），改成在假空间里
+// 点指定 App 直接退出。这里让它自己选是哪个 App。
+@interface DLExitAppPickerController : UITableViewController
+@end
+
 // 文本编辑页（替代不稳定的 PSTextFieldSpecifier）—— 纯 UIViewController + autolayout
 @interface DLTextEditController : UIViewController
 @property (nonatomic, copy)   NSString *cfgKey;
