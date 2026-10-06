@@ -387,6 +387,59 @@ jobs:
           print("✅ Face ID 暂停/恢复链路完整（%d 个恢复点 + 兜底守护 + 硬上限）" % resume_sites)
           PY
 
+          echo "--- 检查 18：⭐⭐ 会话级 Face ID 暂停必须有「锁屏生命周期」级别的无条件恢复 ---"
+          # v0.1.23：把暂停时机提前到「用户敲密码框第一位」（避免那半步的刷脸）。
+          #   代价是「暂停」比「假空间存在」的时刻更早 —— 用户可能：
+          #     输到一半放弃走开 / 输真密码 / 输伪密码 / 直接按电源键...
+          #   任何一种都必须恢复。所以最可靠的时机是**锁屏消失**那一刻。
+          #   ⚠️ 漏掉这一句 = 用户 Face ID 从开始输密码起被永久关死（严重事故）。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          common_m = io.open('DLCommon.m', encoding='utf-8', errors='replace').read()
+          common_h = io.open('DLCommon.h', encoding='utf-8', errors='replace').read()
+          twk = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          twk_nc = re.sub(r'//[^\n]*', '', twk)
+
+          # 1) 会话 API 必须三个都在（开始 / 结束 / 查询）
+          for sym in ('DLBeginPasscodeSession', 'DLEndPasscodeSession', 'DLPasscodeSessionActive'):
+              if sym not in common_h:
+                  print("❌ DLCommon.h 缺少 %s 声明" % sym)
+                  sys.exit(1)
+              if sym not in common_m:
+                  print("❌ DLCommon.m 缺少 %s 实现" % sym)
+                  sys.exit(1)
+
+          # 2) 暂停必须接在「用户开始输入」的最早信号上
+          if 'DLBeginPasscodeSession()' not in twk_nc:
+              print("❌ Tweak.x 里没有调用 DLBeginPasscodeSession()（会话级暂停没接线）")
+              sys.exit(1)
+          # 必须出现在 SBUIPasscodeEntryField 的 appendString: 里
+          m = re.search(r'%hook SBUIPasscodeEntryField.*?%end', twk_nc, re.S)
+          if not m or 'DLBeginPasscodeSession()' not in m.group(0):
+              print("❌ DLBeginPasscodeSession() 不在 SBUIPasscodeEntryField 块里")
+              print("   → 必须在「用户敲第一位密码」时暂停，否则又会晚半步")
+              sys.exit(1)
+
+          # 3) 恢复必须接在锁屏生命周期上（最关键的一道闸）
+          m2 = re.search(r'-\s*\(void\)noteLockScreenUIDidDisappear\s*\{.*?\n\}', twk_nc, re.S)
+          if not m2:
+              print("❌ 找不到 noteLockScreenUIDidDisappear 钩子体")
+              sys.exit(1)
+          if 'DLEndPasscodeSession()' not in m2.group(0):
+              print("❌ noteLockScreenUIDidDisappear 里没有 DLEndPasscodeSession()")
+              print("   → 用户从锁屏离开时 Face ID 不会恢复 → 被永久关死（严重事故）")
+              sys.exit(1)
+
+          # 4) 会话 API 的实现里必须真的调用 DLSetBiometricMatching
+          if not re.search(r'DLEndPasscodeSession\(void\).*?DLSetBiometricMatching\(YES\)',
+                           common_m, re.S):
+              print("❌ DLEndPasscodeSession() 没有恢复生物识别匹配")
+              sys.exit(1)
+
+          print("✅ 会话级 Face ID 暂停/恢复完整（输入时暂停 + 锁屏消失无条件恢复）")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

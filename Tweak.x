@@ -532,6 +532,12 @@ static void DLClearField(id field) {
 // ⚠️ 顺序很重要（v0.1.17 调整）：**先判定、后放行**。
 //    旧版是 %orig 在前，等于系统已经吃下这一位我们才判定 —— 太晚了。
 - (void)appendString:(NSString *)s {
+    // ⭐⭐ v0.1.23：用户敲下密码框第一位 = 「开始输密码」的最早可观测信号。
+    //   在这里就把 Face ID 匹配暂停掉 —— 比 v0.1.22（假空间铺完才暂停）提前了
+    //   好几秒，从源头避免「按完最后一位那一瞬间系统已发起刷脸」。
+    //   幂等：同一轮输入只生效一次；会话结束由锁屏生命周期负责恢复。
+    DLBeginPasscodeSession();
+
     DLAppendInput(s, @"entry.append");     // 更新缓冲 + 主动判定（内部会设抑制标志）
 
     if (DLConsumeSuppress()) {
@@ -1267,7 +1273,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.22 假空间期间暂停 Face ID）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.23 输密码即暂停 Face ID）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1417,6 +1423,11 @@ static void DLLogInputCapture(NSString *src) {
 - (void)noteLockScreenUIDidDisappear {
     // 进真桌面时清掉一切痕迹（避免下次锁屏被上次输入污染）
     DLResetInput();
+    // ⭐⭐ v0.1.23：锁屏消失 = 输密码会话**必然**结束。
+    //   这里**无条件恢复** Face ID 匹配 —— 无论用户是输真密码、输伪密码、
+    //   还是干脆放弃走开，锁屏消失都必须恢复。
+    //   ⚠️⚠️ 这是防「Face ID 被永久关死」最关键的一道闸。
+    DLEndPasscodeSession();
     // ⭐ v0.1.19：锁屏消失 = 用户大概率去解锁了（真实密码 / Face ID）。
     //    此时**必须**把我们自建的窗口拆掉 —— 否则它会以一个
     //    「看不见却挡触摸」的高层级窗口留在界面上，用户就会出现

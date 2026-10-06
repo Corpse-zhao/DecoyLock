@@ -30,7 +30,7 @@ static NSString *const kDLDomain = @"com.blr.decoylock";
 //       拿不到 DLCommon.h 里的 DL_VERSION。
 //    诊断页会拿它跟「插件启动横幅」里的版本对比，
 //    一眼看出 SpringBoard 里跑的到底是不是新版。
-static NSString *const kDLPrefsVersion = @"0.1.22";
+static NSString *const kDLPrefsVersion = @"0.1.23";
 
 // ---------------------------------------------------------------------------
 // 配置读写（共享目录 + NSUserDefaults，SpringBoard 侧可读）

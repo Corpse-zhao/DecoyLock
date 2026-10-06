@@ -716,11 +716,16 @@ static void DLBioGuardTick(NSInteger gen) {
         DLRestoreKeyWindow();
     }
 
-    // ⭐⭐ v0.1.22：假空间铺上之后，立刻暂停 Face ID 匹配。
+    // ⭐⭐ v0.1.22：假空间铺上之后，暂停 Face ID 匹配。
     //   用户日志实锤：系统**没有**判密码错误（无 resetForFailedPasscode），
     //   假空间也确实呈现了（windowLevel=10001011），但真机最后被解开了
-    //   （退出后 [退出清理] 未找到密码框）—— 那次解锁是 Face ID 干的。
-    //   走 DLPauseBiometric：暂停的同时挂上兜底守护（见上方说明）。
+    //   —— 那次解锁是 Face ID 干的。
+    //
+    // ⭐ v0.1.23：这已从「主路径」降级为**兜底**。
+    //   主路径提前到了「用户敲密码框第一位」（DLBeginPasscodeSession，见 Tweak.x），
+    //   因为用户实测 v0.1.22「假空间出来了，但中间还是闪了一下刷脸」——
+    //   说明等到这里才暂停**晚了半步**。
+    //   这里保留是防止某些输入路径绕过了 appendString:（粘贴/自动填充）。
     DLPauseBiometric();
 }
 

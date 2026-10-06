@@ -14,7 +14,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#define DL_VERSION      @"0.1.22"
+#define DL_VERSION      @"0.1.23"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 
 // 共享配置目录（SpringBoard 进程与「设置」进程都能写的位置）
@@ -71,5 +71,23 @@ FOUNDATION_EXPORT void DLSetBiometricMatching(BOOL enabled);
 
 // 查询我们当前是否处于「已暂停生物识别匹配」状态（供兜底守护判断）
 FOUNDATION_EXPORT BOOL DLBiometricMatchingIsOff(void);
+
+// ⭐⭐ v0.1.23：会话级 Face ID 暂停（把暂停时机**提前到用户开始输密码**）。
+//
+// 背景（2026-10-06 用户录屏 + 口述实锤）：v0.1.22 是「假空间铺上之后」才暂停 Face ID，
+// 用户反馈「假空间出来了，但中间还是闪了一下刷脸」。
+// 原因：系统在用户按完最后一位的**那一瞬间**就开始 Face ID 匹配，
+// 我们等假空间铺完才暂停 —— **晚了半步**，那一下已经被放行了。
+//
+// 正解：把暂停提前到「用户敲下密码框第一位」的时刻（SBUIPasscodeEntryField
+// appendString: 第一次被调用）。从那一刻起系统就无法发起匹配。
+//
+// ⚠️⚠️ 恢复约束（比 v0.1.22 更严）：
+//   会话可能以任何方式结束（用户放弃输密码走开、锁屏消失、假空间退出...），
+//   所以除了原有的恢复点外，**锁屏生命周期结束时必须无恢复条件地恢复**。
+//   绝不使用户的 Face ID 被永久关死。
+FOUNDATION_EXPORT void DLBeginPasscodeSession(void);   // 用户开始输密码 → 暂停 Face ID
+FOUNDATION_EXPORT void DLEndPasscodeSession(void);     // 会话结束 → 恢复 Face ID
+FOUNDATION_EXPORT BOOL DLPasscodeSessionActive(void);  // 是否处于输密码会话中
 
 #endif /* DLCommon_h */

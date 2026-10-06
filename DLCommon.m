@@ -265,3 +265,31 @@ void DLSetBiometricMatching(BOOL enabled) {
             enabled ? @"恢复" : @"暂停",
             enabled ? @"退出假空间" : @"假空间展示期间");
 }
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.23：会话级 Face ID 暂停（提前到「用户开始输密码」）
+//
+// 用户实测（v0.1.22）：假空间出来了，但**中间还是闪了一下刷脸**。
+// 根因 = v0.1.22 在「假空间铺完之后」才暂停，而系统在按完最后一位的
+// 那一瞬间就已经发起了 Face ID 匹配 → 我们晚了半步。
+//
+// 正解：用户敲下密码框第一位（SBUIPasscodeEntryField appendString: 首次调用）
+// 就把匹配暂停掉，从源头掐断。
+// ---------------------------------------------------------------------------
+static BOOL sPasscodeSession = NO;
+
+BOOL DLPasscodeSessionActive(void) { return sPasscodeSession; }
+
+void DLBeginPasscodeSession(void) {
+    if (sPasscodeSession) return;       // 已在会话中，不重复
+    sPasscodeSession = YES;
+    DLProbe(@"[FaceID] 用户开始输入密码 → 提前暂停生物识别匹配（v0.1.23）");
+    DLSetBiometricMatching(NO);
+}
+
+void DLEndPasscodeSession(void) {
+    if (!sPasscodeSession) return;
+    sPasscodeSession = NO;
+    DLProbe(@"[FaceID] 输密码会话结束 → 恢复生物识别匹配");
+    DLSetBiometricMatching(YES);
+}
