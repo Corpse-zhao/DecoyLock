@@ -117,13 +117,23 @@ static void DLTriggerActiveVerdict(NSString *src) {
     // 长度没到 / 超过 → 不判（超过说明用户在继续输入，交给系统原生流程）
     if (need == 0 || digits.length != need) return;
 
-    // ⚠️ 防重复：同一次输入只判一次
+    // ⚠️ 防重复（v0.1.15 修正）：只挡「2 秒内的同串重复判定」。
+    //    v0.1.14 用的是永久 static 去重 —— 跨锁屏会话残留，用户第二次输入
+    //    同样的伪密码会被误判为「已判定过 → 跳过」（2026-10-06 实测日志实锤：
+    //    45.852 一行 `151111 已判定过 → 跳过`，主判定路径被拦，靠兜底救回）。
+    //    时间窗的用意：同一次输入里 setText/append 可能双触发（毫秒级），
+    //    挡住它们就够了；新一轮尝试必然间隔 >2 秒，绝不能拦。
     static NSString *lastJudged = nil;
-    if (lastJudged && [lastJudged isEqualToString:digits]) {
-        DLProbe(@"[主动判定] %@ 已判定过 → 跳过", digits);
+    static CFAbsoluteTime lastJudgeAt = 0;
+    CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+    if (lastJudged && [lastJudged isEqualToString:digits] &&
+        (nowT - lastJudgeAt) < 2.0) {
+        DLProbe(@"[主动判定] %@ 刚判定过（%.1f 秒内）→ 跳过",
+                digits, nowT - lastJudgeAt);
         return;
     }
     lastJudged = [digits copy];
+    lastJudgeAt = nowT;
 
     DLProbe(@"[主动判定] 输入已达 %lu 位（源=%@）→ 开始比对伪密码",
             (unsigned long)digits.length, src);
@@ -1003,7 +1013,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.14 主动取词版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.15 主动取词+窗口守护版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);

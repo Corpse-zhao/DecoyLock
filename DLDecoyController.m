@@ -132,6 +132,13 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 @implementation DLDecoyController
 
 static DLDecoyController *sShared = nil;
+// ⭐ v0.1.15：窗口必须自己强持有！
+//   2026-10-06 实测：presentIfConfigured 里 win 是局部变量，只靠
+//   UIApplication 的窗口列表保活 —— 实测日志显示窗口在呈现后 ~1.2 秒内
+//   就变成了 isShowing==NO（被宿主 SpringBoard 在 CoverSheet 重置时
+//   隐藏或移出层级）。自己持有一份强引用，至少排除「被回收」这一种可能；
+//   剩下的「被隐藏/被移除」交给下面的守护循环（startKeeper）自愈。
+static UIWindow *sWindow = nil;
 
 // ---------------------------------------------------------------------------
 // ⭐⭐ v0.1.14 主动取词 —— 核心决策
@@ -194,21 +201,76 @@ static DLDecoyController *sShared = nil;
         return DLPasscodeVerdictDecoy;
     }
 
-    // 关键：双保险。系统会在我们之后（几十~几百 ms）弹出密码错误界面，
-    // 所以我们**延迟一点**呈现，并且呈现后 1.2 秒再补一次，
-    // 把系统那个「密码错误」的锁屏层彻底盖住。
+    // 关键：双保险（v0.1.15 重做）。
+    //   ① 立刻异步呈现（赶在系统「密码错误」动画之前把假空间铺上去）
+    //   ② 呈现后启动 15 秒守护循环：每 0.5 秒查一次，窗口被系统隐藏/移除
+    //      就当场复活。2026-10-06 实测：首次呈现 1.2 秒后窗口就没了
+    //      （isShowing==NO），单次「补呈现」治标不治本，必须持续守护。
     dispatch_async(dispatch_get_main_queue(), ^{
         [DLDecoyController presentIfConfigured];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (![DLDecoyController isShowing]) {
-            DLProbe(@"[主动判定] 补一次呈现（系统密码错误界面可能盖住了首次呈现）");
-            [DLDecoyController presentIfConfigured];
-        }
-    });
+    [DLDecoyController startKeeper];
 
     return DLPasscodeVerdictDecoy;
+}
+
+#pragma mark - ⭐ v0.1.15 窗口守护（自愈 + 根因取证）
+
+static BOOL sKeeperActive = NO;
+
+// 启动守护循环：0.5 秒 × 30 次 = 覆盖呈现后最初 15 秒
+// （实测窗口正是在呈现后 ~1.2 秒被系统动掉的，15 秒足够跨过 CoverSheet 重置期）
++ (void)startKeeper {
+    if (sKeeperActive) return;      // 已有守护在跑，不叠加
+    sKeeperActive = YES;
+    [self keeperTick:0];
+}
+
++ (void)keeperTick:(NSInteger)n {
+    if (![DLDecoyController isShowing]) {
+        // ⭐ 取证优先：把「窗口到底怎么了」写进日志，下一轮排查直接看根因
+        NSString *state;
+        if (!sShared) {
+            state = @"实例已被释放";
+        } else if (!sShared.view.window) {
+            state = @"窗口已脱离视图层级（被系统移除或回收）";
+        } else {
+            state = [NSString stringWithFormat:@"窗口还在但被隐藏（hidden=YES, level=%.0f）",
+                     sShared.view.window.windowLevel];
+        }
+        DLProbe(@"[守护] 第 %ld 次检查：假空间不可见（%@）→ 立即复活",
+                (long)n, state);
+        [self reviveOrPresent];
+    }
+    if (n + 1 < 30) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [DLDecoyController keeperTick:n + 1];
+        });
+    } else {
+        sKeeperActive = NO;
+        // 守护结束前做最后一次确认（留一行日志，方便判断 15 秒内有没有动过）
+        if (![DLDecoyController isShowing]) {
+            DLProbe(@"[守护] 15 秒守护结束，假空间仍不可见（交给兜底判定点）");
+        }
+    }
+}
+
+// 能复活就不重建（重建会闪一下黑屏）：
+//   窗口还在、只是被隐藏 → 直接重新可见 + makeKey
+//   窗口没了 / 实例没了  → 走完整重建
++ (void)reviveOrPresent {
+    if (sShared && sShared.view.window) {
+        UIWindow *win = sShared.view.window;
+        if (win.hidden || ![win isKeyWindow]) {
+            DLProbe(@"[守护] 复活：窗口重新可见（level=%.0f）", win.windowLevel);
+            win.hidden = NO;
+            [win makeKeyAndVisible];
+        }
+        return;
+    }
+    DLProbe(@"[守护] 复活失败：窗口/实例已丢失 → 完整重建");
+    [self presentIfConfigured];
 }
 
 // 伪造「密码错误」外观（仅在极少数无法判定的场景下用）
@@ -281,9 +343,14 @@ static DLDecoyController *sShared = nil;
         return;
     }
 
-    // 盖在锁屏 / 通知中心 / 控制中心 之上
-    win.windowLevel = UIWindowLevelAlert + 100.0;
+    // 盖在锁屏 / 通知中心 / 控制中心 之上。
+    // ⭐ v0.1.15：2100 不保险 —— SpringBoard 自己的锁屏（CoverSheet）窗口
+    //    用的自定义层级，实测我们的窗口在 2100 层可能被压在下面或被重置。
+    //    直接拉到 100000（远高于系统所有常规层级；本窗口无键盘、无系统
+    //    交互，高层级无副作用）。
+    win.windowLevel = 100000.0;
     win.rootViewController = vc;
+    sWindow = win;   // ⭐ 自己强持有（防止宿主回收，见 sWindow 注释）
 
     // 关键：让这个窗口能收到触摸（hidden 的窗口收不到）
     win.hidden = NO;
@@ -296,8 +363,9 @@ static DLDecoyController *sShared = nil;
 + (void)dismissDecoy {
     if (!sShared) return;
     DLProbe(@"decoy 退出假空间");
-    UIWindow *win = sShared.view.window;
+    UIWindow *win = sShared.view.window ?: sWindow;   // v0.1.15：兜底取强持有的窗口
     sShared = nil;
+    sWindow = nil;
 
     // 直接销毁自建窗口（不能只 dismiss 模态 —— 窗口还在就还在屏幕上）
     if (win) {
