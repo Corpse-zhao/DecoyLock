@@ -1,6 +1,6 @@
 Package: com.blr.decoylock.prefs
 Name: 伪锁屏设置
-Version: 0.2.4
+Version: 0.2.5
 Architecture: iphoneos-arm
 Description: 伪锁屏插件的设置面板
 Maintainer: 板栗仁

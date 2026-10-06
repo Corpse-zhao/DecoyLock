@@ -1112,6 +1112,190 @@ static void DLReconClass(Class c, NSString *reason) {
 }
 
 // ---------------------------------------------------------------------------
+// ⭐⭐⭐⭐⭐ v0.2.5：「Face ID 决策点闸门」—— 真正停用生物识别匹配
+//
+// 🔥 血泪根因（v0.2.2 日志实锤，我信了三个版本）：
+//   日志写「已暂停生物识别匹配 → 命中 CSBiometricMatchMonitor
+//   -getBiometricMatchResultForTriggerTimeStamp:」——
+//   但那是个 **getter**（读匹配结果），调用它**什么都不改变**。
+//   **Face ID 从未被停用过。** 假成功日志把排查带偏了三轮。
+//
+// 🔥 为什么「命令式暂停」物理上走不通：
+//   `SBUIBiometricResource` 的真开关是**断言机制**：
+//       _addMatchingAssertion: / _removeMatchingAssertion:
+//       acquireMatchingAssertionWithMode:reason:
+//   全都要一个「断言对象」参数，而那对象由系统在开匹配时创建，**我们造不出来**。
+//
+// ✅ 正解 = **不命令，改拦截**：
+//   系统决定「要不要匹配」时一定会**问**某个 BOOL 方法。拦它，
+//   在假空间期间直接回答 NO。**无参数、无对象依赖** —— 唯一可行的路。
+//
+// 做法：运行时枚举**所有**含 "Biometric" 的类（不限于大写 B，也有小写），
+//   在继承链上找出「名字像匹配开关 + 返回 BOOL + 零参数」的方法，全部挂钩。
+//   挂钩后：假空间期间返回 NO，其余时间转原 IMP（绝不影响正常使用）。
+//   同时把「系统实际问了哪个方法」打进日志 —— 下一轮不用再猜。
+// ---------------------------------------------------------------------------
+
+// 方法名是否「像匹配开关查询」。
+// ⚠️ 必须是**查询语义**（enabled / allowed / available / active / armed ...），
+//    **不能**含 getter 特征（get / result / event / info / state / timestamp）——
+//    v0.2.2 就是栽在把 getter 当成开关上。
+static BOOL DLGateNameLooksLikeSwitch(NSString *sel) {
+    if (!sel.length) return NO;
+    NSString *s = sel;
+
+    // 排除明确是「取值/结果」的方法（这些不是开关，调了也没用）
+    NSArray<NSString *> *deny = @[ @"get", @"Result", @"result", @"Event", @"event",
+                                   @"Info", @"info", @"State", @"state",
+                                   @"TimeStamp", @"timestamp", @"Description" ];
+    for (NSString *d in deny) {
+        if ([s hasPrefix:d]) return NO;
+    }
+
+    // 必须同时含「匹配/Biometric」+ 一个「开关」词根
+    BOOL subject = ([s rangeOfString:@"Match" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [s rangeOfString:@"Biometric" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [s rangeOfString:@"Pearl" options:NSCaseInsensitiveSearch].location != NSNotFound);
+    if (!subject) return NO;
+
+    NSArray<NSString *> *switchy = @[ @"Enabled", @"enabled", @"Allowed", @"allowed",
+                                      @"Available", @"available", @"Active", @"active",
+                                      @"Armed", @"armed", @"Should", @"should",
+                                      @"Can", @"can", @"Is", @"is", @"Has", @"has",
+                                      @"Wants", @"wants", @"Suppress", @"suppress" ];
+    for (NSString *w in switchy) {
+        if ([s rangeOfString:w].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// 这些类上有我们要拦的开关（运行时枚举出来后逐个挂钩）
+static NSMutableDictionary<NSString *, NSValue *> *gDLGateOrig = nil;
+static NSMutableSet<NSString *> *gDLGateInstalled = nil;
+static void DLGateInstallOnClass(Class c, NSString *why);
+static BOOL DLGateNameLooksLikeSwitch(NSString *sel);
+
+// 枚举所有含 Biometric 的类，装闸门
+static void DLGateInstallAll(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    if (!DLIsSpringBoard()) return;
+
+    int cnt = objc_getClassList(NULL, 0);
+    if (cnt <= 0) return;
+    Class *all = (Class *)malloc(sizeof(Class) * (size_t)cnt);
+    if (!all) return;
+    cnt = objc_getClassList(all, cnt);
+
+    NSMutableArray<NSString *> *seen = [NSMutableArray array];
+    for (int i = 0; i < cnt; i++) {
+        Class c = all[i];
+        if (!c) continue;
+        const char *nm = class_getName(c);
+        if (!nm) continue;
+        NSString *cn = @(nm);
+        // 大小写都要认（日志里既有 SBUIBiometric* 也有 biome…）
+        if ([cn rangeOfString:@"Biometric" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+            [cn rangeOfString:@"Pearl" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+            [cn rangeOfString:@"Mesa" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+
+        // 只认系统镜像（绝不碰第三方框架）
+        const char *image = class_getImageName(c);
+        if (!image) continue;
+        NSString *imgPath = [NSString stringWithUTF8String:image];
+        if (![imgPath hasPrefix:@"/System/Library/"] &&
+            ![imgPath hasPrefix:@"/usr/lib/"]) continue;
+
+        [seen addObject:cn];
+        DLGateInstallOnClass(c, @"枚举Biometric");
+    }
+    free(all);
+    DLProbe(@"[FaceID][闸门] 已扫描 %lu 个 Biometric/Pearl/Mesa 类并尝试安装闸门",
+            (unsigned long)seen.count);
+}
+
+// ---- 闸门替换实现 ----
+// 统一签名的「BOOL (void)」方法。原 IMP 从 gDLGateOrig 里取。（gDLGateOrig 已在上面前置声明）
+
+// 取原 IMP 并转调（非假空间期间，行为完全不变）
+static BOOL DLGateCallOrig(id self, SEL _cmd) {
+    NSString *key = [NSString stringWithFormat:@"%@|%@",
+                     NSStringFromClass(object_getClass(self)), NSStringFromSelector(_cmd)];
+    NSValue *v = gDLGateOrig[key];
+    if (!v) return NO;
+    return ((BOOL (*)(id, SEL))[v pointerValue])(self, _cmd);
+}
+
+// 我们的替换实现：假空间期间回答 NO，其余转原实现
+static BOOL DLGateBOOL0(id self, SEL _cmd) {
+    @try {
+        if (DLShouldBlockBiometricMatching()) {
+            DLNoteBiometricGateHit(NSStringFromClass(object_getClass(self)),
+                                   NSStringFromSelector(_cmd));
+            return NO;              // ⭐ 拦截：系统得到「不允许匹配」
+        }
+    } @catch (__unused NSException *e) { }
+    return DLGateCallOrig(self, _cmd);
+}
+
+static void DLGateInstallOnClass(Class c, NSString *why) {
+    @try {
+        if (!c) return;
+        if (!gDLGateOrig) {
+            gDLGateOrig = [NSMutableDictionary dictionary];
+            gDLGateInstalled = [NSMutableSet set];
+        }
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length) return;
+        if ([gDLGateInstalled containsObject:cn]) return;
+        [gDLGateInstalled addObject:cn];
+
+        int hooked = 0;
+        // ⭐ 关键：连同**继承链**一起扫 —— 开关方法可能定义在父类上
+        //   （`class_copyMethodList` 只返回本类定义的方法，不返回继承的）。
+        for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(cur, &mc);
+            if (!ms) continue;
+            for (unsigned int i = 0; i < mc; i++) {
+                SEL s = method_getName(ms[i]);
+                NSString *selName = NSStringFromSelector(s);
+                if (selName.length <= 1) continue;                 // 跳过 @selector() 之类
+                if ([selName containsString:@":"]) continue;       // ⭐ 只要零参数
+                if (!DLGateNameLooksLikeSwitch(selName)) continue;
+
+                // ⭐ 签名必须是「返回 BOOL，零参数」
+                char *ret = method_copyReturnType(ms[i]);
+                BOOL retIsBool = (ret && (ret[0] == 'c' || ret[0] == 'B'));
+                free(ret);
+                if (!retIsBool) continue;
+                if (method_getNumberOfArguments(ms[i]) != 2) continue;   // self + _cmd
+
+                // ⭐ 幂等：同一个 (类,选择器) 只挂一次（本类已挂过就不重复）
+                NSString *key = [cn stringByAppendingFormat:@"|%@", selName];
+                if (gDLGateOrig[key]) continue;
+
+                IMP old = NULL;
+                MSHookMessageEx(c, s, (IMP)DLGateBOOL0, &old);
+                if (old) {
+                    // ⚠️ 原 IMP 记在**具体类名**下（DLGateCallOrig 按 object_getClass 查），
+                    //    这样才能在子类实例上正确转调。
+                    gDLGateOrig[key] = [NSValue valueWithPointer:(void *)old];
+                    hooked++;
+                    DLProbe(@"[FaceID][闸门] 已挂：%@ -%@（BOOL，零参数，定义在 %@）",
+                            cn, selName, NSStringFromClass(cur));
+                }
+            }
+            if (ms) free(ms);
+        }
+        if (hooked) {
+            DLProbe(@"[FaceID][闸门] %@（%@）：挂 %d 个开关", cn, why ?: @"?", hooked);
+        }
+    } @catch (__unused NSException *e) { }
+}
+
+// ---------------------------------------------------------------------------
 // ⭐ v0.1.11 新增：重点类「全量侦查」（不筛方法名，只筛签名安全性）
 //
 // v0.1.10 的教训：白名单是**我猜的**，猜不中就永远找不到真凶。
@@ -1687,6 +1871,10 @@ static void DLBootRound(void) {
         if (gDLBootRounds == 1) {
             DLHookAllAttemptUnlock();
             DLSetupClearHook();      // ⭐ v0.1.17：安全清空密码框要用原 IMP
+            // ⭐⭐⭐⭐⭐ v0.2.5：安装「Face ID 决策点闸门」
+            //   这是真正停用生物识别匹配的机制（拦截查询，而非命令 API）。
+            //   放在第 1 轮 —— 越早装越好，避免用户抢在安装前就输密码。
+            DLGateInstallAll();
         }
 
         // 侦查挂钩：对嫌疑类挂钩，日志会告诉我们真实的密码验证方法名
@@ -1742,6 +1930,9 @@ static void DLBootRound(void) {
     @autoreleasepool {
         if (DLIsSpringBoard()) {
             DLDumpEnvironment();
+
+            // ⭐ v0.2.5：尽早安装 Face ID 闸门（第 1 轮之前，3 秒等待期内就先装一遍）
+            DLGateInstallAll();
 
             // 首次侦查：构造器阶段先挂一遍（多数情况锁屏类已注册）
             // 之后由 DLBootRound 自己按退避节奏重试

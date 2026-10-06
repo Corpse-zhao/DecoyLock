@@ -14,7 +14,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#define DL_VERSION      @"0.2.4"
+#define DL_VERSION      @"0.2.5"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 
 // 共享配置目录（SpringBoard 进程与「设置」进程都能写的位置）
@@ -110,5 +110,35 @@ FOUNDATION_EXPORT BOOL DLPasscodeSessionActive(void);  // 是否处于输密码�
 FOUNDATION_EXPORT void DLPinToLockScreen(void);        // 进入「锁屏贴纸」模式
 FOUNDATION_EXPORT void DLUnpinFromLockScreen(void);    // 退出该模式
 FOUNDATION_EXPORT BOOL DLPinnedToLockScreen(void);     // 是否处于该模式
+
+// ⭐⭐⭐⭐⭐ v0.2.5：**「拦截决策点」机制** —— 这是真正停用 Face ID 的正解。
+//
+// 🔥🔥🔥 血泪根因（v0.2.2 日志实锤，我信了整整三个版本）：
+//   v0.2.2 日志写着：「[FaceID] 已暂停生物识别匹配（假空间展示期间）
+//                      → 命中路径 CSBiometricMatchMonitor
+//                        -getBiometricMatchResultForTriggerTimeStamp:」
+//   看起来成功了 —— 但 `getBiometricMatchResultForTriggerTimeStamp:` 是个 **getter**
+//   （读取匹配结果），调用它**什么都不改变**。**Face ID 从未被停用过一次。**
+//   这是一条「假成功」日志，把排查方向带偏了三轮。
+//
+// 🔥 为什么「命令式暂停」这条路走不通：
+//   `SBUIBiometricResource` 上的真实开关是**断言机制**：
+//       _addMatchingAssertion: / _removeMatchingAssertion:
+//       acquireMatchingAssertionWithMode:reason:
+//   它们**都需要一个「断言对象」参数** —— 而那个对象是系统在开启匹配时创建的，
+//   我们**造不出来**（私有类型、需要特定 mode/reason）。所以我们永远无法
+//   「命令系统把匹配关掉」。
+//
+// ✅ 正解 = **不命令，改拦截**：
+//   系统在决定「要不要让 Face ID 匹配」时，一定会**问**某个方法
+//   （`isMatchingEnabled` / `hasMatchingAssertions` / `isMatchingAllowed` ...）。
+//   这类查询**没有参数、返回 BOOL** —— 拦它 = 在假空间展示期间直接回答 NO。
+//   不需要任何对象参数，不需要猜私有的构造方式。**这是唯一可行的路。**
+//
+// 实现（Tweak.x）：运行时枚举所有含 Biometric 的类 → 找出「名字像匹配开关查询
+//   且返回 BOOL 且无参」的方法 → 全部挂钩 → 假空间期间强制返回 NO → 退出恢复。
+//   并把「系统实际问了哪个方法」打进日志（下一轮不用再猜）。
+FOUNDATION_EXPORT BOOL DLShouldBlockBiometricMatching(void);   // 现在要不要压制匹配
+FOUNDATION_EXPORT void DLNoteBiometricGateHit(NSString *cls, NSString *sel);  // 记一笔命中
 
 #endif /* DLCommon_h */

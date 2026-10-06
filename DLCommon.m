@@ -740,9 +740,28 @@ void DLSetBiometricMatching(BOOL enabled) {
             if (![inst respondsToSelector:sel]) continue;
 
             // ---- A. 经典 BOOL setter ----
-            if ([selName rangeOfString:@"MatchingEnabled"].location != NSNotFound ||
-                [selName rangeOfString:@"Enable"].location != NSNotFound ||
-                [selName rangeOfString:@"Disable"].location != NSNotFound) {
+            // 🔥🔥🔥 v0.2.5 修正「假成功日志」：
+            //   v0.2.2 日志曾写「已暂停生物识别匹配 → 命中 CSBiometricMatchMonitor
+            //   -getBiometricMatchResultForTriggerTimeStamp:」—— 那是个 **getter**，
+            //   调用它什么都不改变，**Face ID 从未被停用**。这条假日志把排查带偏三轮。
+            //
+            //   根因：下面的子串匹配 `rangeOfString:@"Enable"` 太松，把「读结果」
+            //   的方法也放进来了。修法：**必须同时满足**
+            //     ① 方法名以 `:` 结尾（真 setter，有参数才能写值）
+            //     ② 名字里含明确**写入**词根（Set/Enable/Disable/Resume/Suspend）
+            //     ③ 名字里**不含**读取词根（Get/Result/Is/Has/Should/Can/Wants）
+            BOOL nameHasColon = [selName hasSuffix:@":"];
+            BOOL looksSetter = ([selName rangeOfString:@"Set"].location != NSNotFound ||
+                                [selName rangeOfString:@"Enable"].location != NSNotFound ||
+                                [selName rangeOfString:@"Disable"].location != NSNotFound ||
+                                [selName rangeOfString:@"Resume"].location != NSNotFound ||
+                                [selName rangeOfString:@"Suspend"].location != NSNotFound);
+            BOOL looksGetter = ([selName hasPrefix:@"get"] ||
+                                [selName hasPrefix:@"Get"] ||
+                                [selName rangeOfString:@"Result"].location != NSNotFound ||
+                                [selName rangeOfString:@"isMatching"].location != NSNotFound ||
+                                [selName rangeOfString:@"hasMatching"].location != NSNotFound);
+            if (nameHasColon && looksSetter && !looksGetter) {
                 ((void (*)(id, SEL, BOOL))objc_msgSend)(inst, sel, want);
                 sBioMatchingOff = wantOff;
                 DLProbe(@"[FaceID] 已%@生物识别匹配（%@）→ 命中路径 [分数 %d] %@ (%@) -%@",
@@ -844,4 +863,38 @@ void DLUnpinFromLockScreen(void) {
     if (!sPinnedToLock) return;
     sPinnedToLock = NO;
     DLProbe(@"[锁屏贴纸] 退出「不解锁真机」模式 —— 恢复为正常锁屏");
+}
+
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐⭐⭐ v0.2.5：「拦截决策点」—— 真正停用 Face ID 的正解
+//
+// 为什么不用「命令式暂停」：见 DLCommon.h 里的长注释。
+// 一句话：`SBUIBiometricResource` 的开关是**断言机制**，需要「断言对象」参数，
+// 我们造不出来 → 命令这条路在物理上就走不通（v0.1.22→v0.2.4 全部失败）。
+//
+// 所以改成「拦截查询」：系统在决定要不要匹配时会**问**某个 BOOL 方法，
+// 我们在假空间展示期间直接回答 NO。
+// ---------------------------------------------------------------------------
+
+// 现在是否应该压制生物识别匹配。
+//   判据 = 「假空间正在展示」**或**「正在输密码的会话中」。
+//   ⚠️ 绝不能只看「我的开关还开着吗」—— 外部（系统）会重置它，
+//      必须看**业务对象在不在**（沿用 §51 守护铁律的思想）。
+BOOL DLShouldBlockBiometricMatching(void) {
+    if (sPinnedToLock) return YES;        // 假空间（锁屏贴纸）正在展示
+    if (sPasscodeSession) return YES;     // 用户正在输密码
+    return NO;
+}
+
+// 命中记录：把「系统到底问了哪个方法」打进日志（每个组合只打一次）
+void DLNoteBiometricGateHit(NSString *cls, NSString *sel) {
+    static NSMutableSet<NSString *> *sGateLogged = nil;
+    if (!sGateLogged) sGateLogged = [NSMutableSet set];
+    @try {
+        NSString *key = [NSString stringWithFormat:@"%@|%@", cls ?: @"?", sel ?: @"?"];
+        if ([sGateLogged containsObject:key]) return;
+        [sGateLogged addObject:key];
+        DLProbe(@"★★★ [FaceID][闸门] 拦截命中：%@ -%@ → 回答 NO（本次假空间期间不再匹配）",
+                cls ?: @"?", sel ?: @"?");
+    } @catch (__unused NSException *e) { }
 }

@@ -808,6 +808,102 @@ jobs:
           print("✅ ARC 桥接正确（ObjC 指针未直接强转成 C 指针）")
           PY
 
+          echo "--- 检查 25：⭐⭐⭐⭐⭐ Face ID「决策点闸门」（v0.2.5 唯一可行路径）---"
+          # v0.2.5 血泪根因：v0.2.2 日志写「已暂停生物识别匹配 → 命中
+          #   CSBiometricMatchMonitor -getBiometricMatchResultForTriggerTimeStamp:」，
+          #   但那是个 **getter**（读结果），调用它什么都不改变 ——
+          #   **Face ID 从未被停用过一次**，假成功日志把排查带偏三轮。
+          #
+          #   为什么「命令式暂停」物理走不通：SBUIBiometricResource 的开关是
+          #   断言机制（_addMatchingAssertion: / _removeMatchingAssertion:
+          #   / acquireMatchingAssertionWithMode:reason:），**全都要断言对象参数**，
+          #   而那对象由系统创建，我们造不出来。
+          #
+          #   正解 = 不命令，改**拦截查询**：系统决定要不要匹配时会问某个
+          #   零参数 BOOL 方法，在假空间期间回答 NO。
+          python3 - <<'PY' || FAIL=1
+          import io, sys, re
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          tw = read('Tweak.x')
+          cm = read('DLCommon.m')
+
+          # —— Tweak.x 侧：闸门机制必须齐备 ——
+          must_tw = [
+              ('DLGateNameLooksLikeSwitch',  '闸门方法名判定'),
+              ('DLGateInstallAll',           '闸门安装入口'),
+              ('DLGateInstallOnClass',       '闸门逐类安装'),
+              ('DLGateBOOL0',                '闸门替换实现'),
+              ('DLShouldBlockBiometricMatching', '闸门判据查询'),
+              ('DLNoteBiometricGateHit',     '闸门命中日志'),
+              ('(IMP)DLGateBOOL0',           '闸门挂钩'),
+          ]
+          for sym, desc in must_tw:
+              if sym not in tw:
+                  print("❌ Tweak.x 缺少 %s（%s）" % (sym, desc)); sys.exit(1)
+
+          # 闸门必须在 %ctor 里被安装（尽早生效）
+          ctor = tw[tw.find('%ctor'):] if '%ctor' in tw else ''
+          if 'DLGateInstallAll' not in ctor:
+              print("❌ %ctor 里没有调用 DLGateInstallAll → 闸门不会在启动时装上"); sys.exit(1)
+
+          # 闸门替换体必须在假空间期间返回 NO
+          i = tw.find('static BOOL DLGateBOOL0')
+          body = tw[i:i+700]
+          if 'DLShouldBlockBiometricMatching' not in body or 'return NO' not in body:
+              print("❌ DLGateBOOL0 没有「假空间期间 return NO」的拦截逻辑"); sys.exit(1)
+          if 'DLGateCallOrig' not in body:
+              print("❌ DLGateBOOL0 没有转调原实现 → 会破坏非假空间期间的正常匹配"); sys.exit(1)
+
+          # —— DLCommon.m 侧：判据 + 命中记录 ——
+          if 'BOOL DLShouldBlockBiometricMatching' not in cm:
+              print("❌ DLCommon.m 缺少 DLShouldBlockBiometricMatching"); sys.exit(1)
+          if 'void DLNoteBiometricGateHit' not in cm:
+              print("❌ DLCommon.m 缺少 DLNoteBiometricGateHit"); sys.exit(1)
+
+          # 判据必须看「业务对象在不在」（sPinnedToLock / sPasscodeSession），
+          # 绝不能只看「我的开关还开着吗」（外部会重置，会提前收工）
+          i = cm.find('BOOL DLShouldBlockBiometricMatching')
+          jb = cm[i:i+600]
+          if 'sPinnedToLock' not in jb:
+              print("❌ DLShouldBlockBiometricMatching 没看 sPinnedToLock（业务对象）"); sys.exit(1)
+
+          print("✅ Face ID 决策点闸门齐备（拦截查询，非命令式）")
+          PY
+
+          echo "--- 检查 26：⭐⭐⭐⭐ 禁止「假成功日志」—— 停用生物识别必须真 setter ---"
+          # v0.2.2 事故固化：日志谎报「已暂停生物识别匹配」，实际调的是 getter。
+          # 规则：那条「已…生物识别匹配（…）→ 命中路径」日志所在分支，**守卫它的
+          #   if 条件**必须真的用到三个判据：
+          #     ① 要求方法名以 ':' 结尾（真 setter 才有参数可写）
+          #     ② 有明确的 setter 词根判定（looksSetter）
+          #     ③ 排除 getter（looksGetter）
+          # ⚠️ 只查「附近出现过变量名」是不够的：变量声明就在上面几行，条件被改回
+          #    宽松版时名字依然在窗口里 → 会漏报（注入测试实测漏过）。必须查 if 条件本身。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          cm = io.open('DLCommon.m', encoding='utf-8', errors='replace').read()
+          i = cm.find('已%@生物识别匹配（%@）→ 命中路径')
+          if i < 0:
+              print("❌ 找不到「已…生物识别匹配（…）→ 命中路径」日志（setter 停用路径）")
+              sys.exit(1)
+          seg = cm[max(0, i-1400):i]
+          conds = re.findall(r'if\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*\{', seg)
+          guard = conds[-1] if conds else ''
+          for need, desc in [('looksSetter', 'setter 词根判定'),
+                             ('looksGetter', 'getter 排除判定'),
+                             ('nameHasColon', "要求以 ':' 结尾（真 setter）")]:
+              if need not in guard:
+                  print("❌ 守卫「生物识别停用」日志的 if 条件没有用 %s（%s）" % (need, desc))
+                  print("   → 这正是 v0.2.2 假成功日志的根因，禁止复活")
+                  sys.exit(1)
+          if 'hasPrefix:@"get"' not in seg:
+              print("❌ 没有排除 get 前缀的取值器 → 又会把 getter 当开关"); sys.exit(1)
+          print("✅ 生物识别停用日志只可能来自真 setter（不会再现假成功）")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"
