@@ -5,6 +5,15 @@
 #import <UIKit/UIKit.h>
 #import <unistd.h>
 
+// ⭐ v0.1.18a 修正：objc 运行时函数（object_getClass / class_getInstanceMethod /
+//    MSHookMessageEx 等）必须在此统一声明。
+//    踩坑记录：原先只有 Tweak.x 单独 #import <objc/runtime.h>，
+//    DLDecoyController.m 是**独立编译单元**，用了 object_getClass 却没有声明 →
+//    CI 报 4 连错（implicit declaration / conflicting types）。
+//    放进共享头文件 = 一劳永逸，任何新 .m 都不会再犯。
+#import <objc/runtime.h>
+#import <objc/message.h>
+
 #define DL_VERSION      @"0.1.18"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 

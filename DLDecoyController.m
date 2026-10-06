@@ -28,6 +28,12 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 @property (nonatomic, strong) UIView *dock;
 @property (nonatomic, strong) NSArray *apps;
 @property (nonatomic, assign) NSInteger statusBarTaps;
+// ⚠️ 内部类方法（只在 .m 内用）也要声明，否则调用点会被当成「找不到的类方法」。
+//    实测在 ObjC 下只是警告（所以一直没挂），但声明显式化更安全 ——
+//    万一哪天返回值不是 void，默认 id 返回会引入隐患。
++ (void)startKeeper;
++ (void)keeperTick:(NSInteger)n;
++ (void)reviveOrPresent;
 @end
 
 #pragma mark - 假 App 单元格
@@ -177,6 +183,16 @@ static CGFloat DLMaxOtherWindowLevel(void) {
 //          判断错了最多是「该进假空间没进」或「不该进进了」，绝不锁死设备。
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ⭐ v0.1.18a 修正：这两个状态**必须声明在 handleCapturedPasscode 之前**。
+//    踩坑记录：原来它们放在下面的「窗口守护」小节（第 233/238 行），
+//    而 handleCapturedPasscode（第 216 行）已经用到了 sUserDismissed →
+//    「use of undeclared identifier」是**硬编译错误**（不像 ObjC 的
+//    方法找不到只是警告）。文件作用域变量一律先声明后用。
+// ---------------------------------------------------------------------------
+static BOOL sKeeperActive = NO;      // 守护循环是否在跑
+static BOOL sUserDismissed = NO;     // ⭐ v0.1.18：区分「系统弄没窗口」与「用户主动退出」
+
 + (DLPasscodeVerdict)handleCapturedPasscode:(NSString *)digits {
     if (!digits.length) return DLPasscodeVerdictNative;
 
@@ -230,12 +246,8 @@ static CGFloat DLMaxOtherWindowLevel(void) {
 
 #pragma mark - ⭐ v0.1.15 窗口守护（自愈 + 根因取证）
 
-static BOOL sKeeperActive = NO;
-// ⭐ v0.1.18：区分「窗口被系统弄没了（要复活）」和「用户自己点退出了（不许复活）」
-//   用户反馈：「点设置退出，在真系统跟假空间之间来回闪，好多次才退出」
-//   → 根因就是守护循环分不清这两者：用户主动退出后 0.5 秒内又被复活，
-//     用户必须连点到 15 秒守护窗口结束才真正退出。
-static BOOL sUserDismissed = NO;
+// ⚠️ sKeeperActive / sUserDismissed 已上移到 handleCapturedPasscode 之前声明
+//    （文件作用域变量必须先声明后用，见上方说明）
 
 // 启动守护循环：0.5 秒 × 30 次 = 覆盖呈现后最初 15 秒
 // （实测窗口正是在呈现后 ~1.2 秒被系统动掉的，15 秒足够跨过 CoverSheet 重置期）

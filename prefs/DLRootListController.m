@@ -68,6 +68,9 @@ static void DLPrefsSave(NSDictionary *cfg) {
 //    「设置」进程根本不加载它 → 链接不到）。这里自己写一份，格式与插件端一致，
 //    这样两边日志都落在同一个 _probe.txt 里，排查时一眼能对上时间线。
 // ---------------------------------------------------------------------------
+// ⭐ v0.1.18a：加 NS_FORMAT_FUNCTION(1,2) —— 让编译器像检查 NSLog 一样检查这里的
+//    格式串（字面 % 必须写 %%）。多一道编译期防线，避免写出会崩的日志调用。
+static void DLPrefsLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void DLPrefsLog(NSString *fmt, ...) {
     if (!fmt) return;
     va_list ap;
@@ -205,6 +208,12 @@ static NSArray *DLDefaultSelection(void) {
 }
 
 // ------------------------------ 按钮动作 ------------------------------
+
+// ⚠️ 前置声明：DLDoRespring 的实现在文件下方（要用到 proc_listpids）。
+//    不声明就调用 → C 的隐式声明把返回值当 int（实测 ObjC 下仅是警告，
+//    所以 v0.1.16 侥幸编译通过）。但这是真隐患：万一哪天函数改成返回指针，
+//    隐式 int 会把 64 位指针截成 32 位 → 崩溃。显式声明掉。
+static void DLDoRespring(void);
 
 - (void)respring {
     UIAlertController *ac = [UIAlertController

@@ -539,7 +539,8 @@ static void DLSetupClearHook(void) {
         return;
     }
     if (!class_getInstanceMethod(c, @selector(clear))) {
-        DLProbe(@"[挂钩] clear：该类未实现 → 不挂钩（避免 %orig 跳 NULL）");
+        // ⚠️ DLProbe 带 NS_FORMAT_FUNCTION(1,2)，字面 % 必须写成 %%
+        DLProbe(@"[挂钩] clear：该类未实现 → 不挂钩（避免 %%orig 跳 NULL）");
         return;
     }
     MSHookMessageEx(c, @selector(clear), (IMP)&DLHookedClear, &gDLOrigClear);

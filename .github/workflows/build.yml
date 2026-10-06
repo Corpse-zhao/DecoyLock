@@ -37,18 +37,15 @@ jobs:
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
-      - name: Build package
-        run: |
-          export THEOS=$HOME/theos
-          # ⚠️ 不要接 `| tail -60`：会把 make 的退出码吞掉，scheme 报错也显示 success
-          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
-          ls -la packages/
-
+      # ⚠️ 顺序很重要：静态自检必须在「Build package」**之前**。
+      #    踩坑记录：v0.1.17 / v0.1.18 两轮 CI 里 Preflight 排在 Build 后面，
+      #    结果编译一挂 → Preflight 被 skipped → 看不到自检结论，白等两轮。
       - name: Preflight — 静态自检（拦下「编译过了但钩子是空的 / 会崩的」）
         run: |
-          # 这些检查专门拦两类错误：
+          # 这些检查专门拦三类错误：
           #   ① Logos 对不存在的类/方法**不报错** → CI 全绿、装上也毫无反应
           #   ② 通用转发挂钩不做签名校验 → 挂到非对象参数方法上 → 锁屏进安全模式
+          #   ③ 自己写的「看着没问题但编译不过」的代码 → CI 挂、白等一轮
           FAIL=0
 
           echo "--- 检查 1：%hook UIResponder 上的输入方法（%orig 会跳 NULL） ---"
@@ -149,8 +146,7 @@ jobs:
               FAIL=1
             fi
           fi
-          if ! grep -qE 'handleCapturedPasscode' Tweak.x prefs/../DLDecoyController.m 2>/dev/null && \
-             ! grep -qE 'handleCapturedPasscode' DLDecoyController.m; then
+          if ! grep -qE 'handleCapturedPasscode' DLDecoyController.m; then
             echo "❌ DLDecoyController 没实现 handleCapturedPasscode:（主动判定的核心比对函数）"
             FAIL=1
           fi
@@ -165,6 +161,86 @@ jobs:
             echo "✅ 主动取词链路完整（输入钩子 → DLTriggerActiveVerdict → handleCapturedPasscode:）"
           fi
 
+          echo "--- 检查 9：⭐ v0.1.18a 格式串里的字面 % 必须写成 %% ---"
+          # 教训（v0.1.17 / v0.1.18 连续两轮 CI 挂掉的根因之一）：
+          #   DLProbe 声明为 NS_FORMAT_FUNCTION(1,2) → 编译器按 printf 规则校验。
+          #   日志文案 "避免 %orig 跳 NULL" 里的 %o 被当成「八进制占位符」，
+          #   而后面没有参数 → error: more '%' conversions than data arguments。
+          #   凡是日志里想写 %orig / %hook 这类 **Logos 字面量**，都要写 %%。
+          python3 - <<'PY'
+          import glob, re, sys
+          files = ["Tweak.x", "DLDecoyController.m", "DLCommon.m"] + glob.glob("prefs/*.m")
+          call = re.compile(r'(?:DLProbe|DLPrefsLog)\s*\(\s*@"((?:[^"\\]|\\.)*)"')
+          # 合法的转换符：修饰符(l/ll/h/hh/z/q/j/t) + 转换字符
+          conv = re.compile(r'%[-+ #0-9.*]*[lhqzjt]*[diouxXeEfgGaAcspn@]')
+          bad = []
+          for f in files:
+              try:
+                  src = open(f, encoding="utf-8").read()
+              except FileNotFoundError:
+                  continue
+              for i, line in enumerate(src.splitlines(), 1):
+                  m = call.search(line)
+                  if not m:
+                      continue
+                  s = m.group(1)
+                  # 先把合法的 %% 摘掉，避免误报
+                  probe = s.replace("%%", "\x00")
+                  # ① 合法转换符后面紧跟【两个以上 ASCII 字母】才算露馅。
+                  #    单个字母不算：%.1fs 的 s 是「秒」单位；%u参 的「参」不是 ASCII
+                  #    （Python 的 str.isalpha() 对中文也返回 True，必须显式 isascii()，
+                  #      否则整片中文日志全是误报 —— 实测连报 3 处）。
+                  for mm in conv.finditer(probe):
+                      nxt = probe[mm.end():mm.end()+2]
+                      if len(nxt) == 2 and all(c.isascii() and c.isalpha() for c in nxt):
+                          bad.append((f, i, s))
+                          break
+                  else:
+                      # ② 剩下还有未匹配的裸 %
+                      rest = conv.sub("", probe)
+                      if "%" in rest:
+                          bad.append((f, i, s))
+          if bad:
+              print("❌ 以下日志格式串里的 %% 没转义（编译会报 -Wformat-insufficient-args）：")
+              for f, i, s in bad:
+                  print("   %s:%d  %s" % (f, i, s))
+              print("   修法：把 %orig / %hook 这类字面量写成 %%orig / %%hook")
+              sys.exit(1)
+          print("✅ 日志格式串检查通过")
+          PY
+          if [ $? -ne 0 ]; then FAIL=1; fi
+
+          echo "--- 检查 10：⭐ objc 运行时函数必须有可见声明（v0.1.17/v0.1.18 编译失败根因之二） ---"
+          # 教训：DLDecoyController.m 用了 object_getClass，但 objc/runtime.h 当时
+          #       **只在 Tweak.x 里导入过**。C 语言按翻译单元独立编译 → 该 .m 看不到声明 →
+          #       4 连错：implicit declaration / conflicting types / deprecated-non-prototype。
+          #       正解：统一在 DLCommon.h 里 #import <objc/runtime.h>，
+          #       产物源文件只要 #import "DLCommon.h" 就自动拿到全部声明。
+          RUNTIME_API='object_getClass|class_getInstanceMethod|class_getMethodImplementation|method_copyReturnType|method_copyArgumentType|method_getTypeEncoding|method_getImplementation|objc_getClassList|objc_copyClassList|class_addMethod|method_setImplementation|class_getName|class_getSuperclass|MSHookMessageEx'
+          for f in Tweak.x DLDecoyController.m DLCommon.m; do
+            [ -f "$f" ] || continue
+            if grep -qE "$RUNTIME_API" "$f"; then
+              if ! grep -qE 'objc/runtime\.h|"DLCommon\.h"' "$f"; then
+                echo "❌ $f 用了 objc 运行时函数，但没有可见声明"
+                echo "   修法：加一行 #import <objc/runtime.h>（或 #import \"DLCommon.h\"，它已统一导入）"
+                FAIL=1
+              fi
+            fi
+          done
+          if [ "$FAIL" -eq 0 ]; then
+            echo "✅ objc 运行时函数声明检查通过"
+          fi
+
+          echo "--- 检查 11：同一个类只能有一个 %hook 块（多个会互相覆盖） ---"
+          DUP=$(grep -oE '^%hook[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' Tweak.x | awk '{print $2}' | sort | uniq -d)
+          if [ -n "$DUP" ]; then
+            echo "❌ 以下类出现了多个 %hook 块（Logos 会以后者为准，前面的钩子静默失效）："
+            echo "$DUP" | sed 's/^/   /'
+            FAIL=1
+          else
+            echo "✅ 无重复 %hook 类"
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"
@@ -174,6 +250,13 @@ jobs:
           echo ""
           echo "--- 本次钩子清单（人工确认用）---"
           grep -nE '^%hook|^%end|^%ctor|^- *\(|^\+ *\(' Tweak.x
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          # ⚠️ 不要接 `| tail -60`：会把 make 的退出码吞掉，scheme 报错也显示 success
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+          ls -la packages/
 
       - name: Inspect package contents
         run: |
@@ -257,7 +340,7 @@ jobs:
               if n.startswith('control.tar'):
                   import io,tarfile
                   with tarfile.open(fileobj=io.BytesIO(b)) as tf:
-                      print(tf.extractfile('control').read().decode()) if False else print(tf.extractfile('./control').read().decode())
+                      print(tf.extractfile('./control').read().decode())
           "; done
         continue-on-error: true
 
