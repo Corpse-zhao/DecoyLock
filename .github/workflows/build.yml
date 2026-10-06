@@ -772,6 +772,42 @@ jobs:
           print("✅ KVC 停用路径 + 呈现/刷脸取证齐备")
           PY
 
+          echo "--- 检查 24：⭐⭐⭐⭐ ARC 桥接（ObjC 指针当 C 指针用必须 __bridge）---"
+          # v0.2.4 第一次 CI 血泪：本地 check_objc 全绿、预检 23 条全过，
+          #   CI 编译才炸：
+          #     DLDecoyController.m:949: error: cast of Objective-C pointer type
+          #       'UIWindowScene *' to C pointer type 'void *' requires a bridged cast
+          #   我想用 %p 打 scene 地址，写了 `(void *)myScene` ——
+          #   ARC 下必须写 `(__bridge void *)myScene`。
+          #   → 本地检查器当时**完全没有「ARC 桥接」这一类**，又白等一轮 CI。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys, glob
+
+          bad = 0
+          for path in sorted(glob.glob('*.m') + glob.glob('*.x')):
+              for i, line in enumerate(io.open(path, encoding='utf-8', errors='replace'), 1):
+                  if '__bridge' in line:
+                      continue
+                  s = line.strip()
+                  if s.startswith('//') or s.startswith('*') or s.startswith('/*'):
+                      continue
+                  # 变量名只取标识符本身（不吃后面的 ] ) , —— 否则 `(void *)old]` 会误报）
+                  for m in re.finditer(r'\(\s*void\s*\*\s*\)\s*([A-Za-z_]\w*)', line):
+                      t = m.group(1)
+                      if t.startswith('&'):
+                          continue
+                      # IMP / 函数指针 是 C 侧符号，合法
+                      if re.match(r'^(old|orig|imp|gDL[A-Za-z]*IMP[A-Za-z]*|gDLOrig[A-Za-z]*)$',
+                                  t, re.I):
+                          continue
+                      print("❌ %s 第 %d 行：`(void *)%s` 需要做 ARC 桥接" % (path, i, t))
+                      print("   改成 `(__bridge void *)%s`，否则报 requires a bridged cast" % t)
+                      bad = 1
+          if bad:
+              sys.exit(1)
+          print("✅ ARC 桥接正确（ObjC 指针未直接强转成 C 指针）")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

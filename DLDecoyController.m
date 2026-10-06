@@ -650,9 +650,11 @@ FOUNDATION_EXPORT void DLDecoyDumpWindowsAroundFaceID(NSString *why) {
         UIWindow *mine = sWindow;   // 自建窗口（静态强持有）
         UIWindowScene *myScene = mine.windowScene;
 
+        // ⚠️ ARC 下把 ObjC 指针当 C 指针用（%p）**必须** `__bridge` 桥接，
+        //    否则 CI 直接报 `cast of Objective-C pointer type ... requires a bridged cast`。
         DLProbe(@"★★ [取证·%@] 假空间 level=%.0f hidden=%d scene=%p",
                 why ?: @"?", mine ? mine.windowLevel : -1.0,
-                mine ? (int)mine.hidden : -1, (void *)myScene);
+                mine ? (int)mine.hidden : -1, (__bridge void *)myScene);
 
         CGFloat myLevel = mine ? mine.windowLevel : -1.0;
         NSInteger above = 0;
@@ -946,8 +948,8 @@ static void DLBioGuardTick(NSInteger gen) {
     DLProbe(@"decoy 已呈现 windowLevel=%.0f scene挂载=%d key=%d（不抢 key window）",
             win.windowLevel, (int)(myScene != nil), (int)win.isKeyWindow);
     DLProbe(@"★★ [取证] 我挂的 scene=%p（activation=%ld）· 锁屏的 scene=%p · 同一个=%@",
-            (void *)myScene, myScene ? (long)myScene.activationState : -1L,
-            (void *)lockScene,
+            (__bridge void *)myScene, myScene ? (long)myScene.activationState : -1L,
+            (__bridge void *)lockScene,
             (myScene && lockScene && myScene == lockScene) ? @"✅ 是" : @"❌ 否（这就是看不到假空间的成因）");
 
     // ⭐⭐⭐ v0.2.4：**呈现之后**再清点一次窗口。
