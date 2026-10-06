@@ -839,10 +839,33 @@ jobs:
               ('DLShouldBlockBiometricMatching', '闸门判据查询'),
               ('DLNoteBiometricGateHit',     '闸门命中日志'),
               ('(IMP)DLGateBOOL0',           '闸门挂钩'),
+              # ⭐ v0.2.6：多路并进 —— 路 A 堵源头 + 路 B 签名取证
+              ('DLAssertSuppressInstallOnClass', '路A：断言方法堵源头'),
+              ('DLAssertReplacementForArity',    '路A：按参数个数选替换（防乱传参）'),
+              ('_addMatchingAssertion:',         '路A：真实断言方法名（来自侦查日志）'),
+              ('DLBiometricSignatureDump',       '路B：全量方法签名取证'),
+              ('零参数 BOOL',                     '路B：签名取证日志'),
           ]
           for sym, desc in must_tw:
               if sym not in tw:
                   print("❌ Tweak.x 缺少 %s（%s）" % (sym, desc)); sys.exit(1)
+
+          # 路 A 必须在 DLGateInstallAll 里被调用（与闸门一起装）
+          i = tw.find('static void DLGateInstallAll')
+          j = tw.find('static void DLGateInstallOnClass', i)
+          body_all = tw[i:j] if j > i else tw[i:i+2000]
+          for need, desc in [('DLAssertSuppressInstallOnClass', '路A 堵源头'),
+                             ('DLBiometricSignatureDump', '路B 签名取证')]:
+              if need not in body_all:
+                  print("❌ DLGateInstallAll 里没调用 %s（%s）→ 该路不会生效"
+                        % (need, desc)); sys.exit(1)
+
+          # 替换实现必须分参数个数（绝不「统一签名乱传参」）
+          for fn in ['DLAssertSuppress0', 'DLAssertSuppress1', 'DLAssertSuppress2']:
+              if fn not in tw:
+                  print("❌ 缺少 %s → 断言方法参数转发不安全" % fn); sys.exit(1)
+          if 'DLAssertReplacementForArity' not in tw:
+              print("❌ 缺少按参数个数分派的 DLAssertReplacementForArity"); sys.exit(1)
 
           # 闸门必须在 %ctor 里被安装（尽早生效）
           ctor = tw[tw.find('%ctor'):] if '%ctor' in tw else ''

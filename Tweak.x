@@ -1174,6 +1174,9 @@ static NSMutableDictionary<NSString *, NSValue *> *gDLGateOrig = nil;
 static NSMutableSet<NSString *> *gDLGateInstalled = nil;
 static void DLGateInstallOnClass(Class c, NSString *why);
 static BOOL DLGateNameLooksLikeSwitch(NSString *sel);
+// ⭐ v0.2.6：路 A / 路 B 的入口（定义在后面，此处前置声明 —— C 里「先用后定义」是硬错误）
+static void DLAssertSuppressInstallOnClass(Class c);
+static void DLBiometricSignatureDump(void);
 
 // 枚举所有含 Biometric 的类，装闸门
 static void DLGateInstallAll(void) {
@@ -1208,11 +1211,16 @@ static void DLGateInstallAll(void) {
             ![imgPath hasPrefix:@"/usr/lib/"]) continue;
 
         [seen addObject:cn];
+        // 路 C：零参数 BOOL 闸门
         DLGateInstallOnClass(c, @"枚举Biometric");
+        // 路 A：断言方法堵源头（已知存在，方法名来自真实日志）
+        DLAssertSuppressInstallOnClass(c);
     }
     free(all);
     DLProbe(@"[FaceID][闸门] 已扫描 %lu 个 Biometric/Pearl/Mesa 类并尝试安装闸门",
             (unsigned long)seen.count);
+    // 路 B：全量签名取证（一次性，结果进日志）
+    DLBiometricSignatureDump();
 }
 
 // ---- 闸门替换实现 ----
@@ -1293,6 +1301,188 @@ static void DLGateInstallOnClass(Class c, NSString *why) {
             DLProbe(@"[FaceID][闸门] %@（%@）：挂 %d 个开关", cn, why ?: @"?", hooked);
         }
     } @catch (__unused NSException *e) { }
+}
+
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐⭐⭐ v0.2.6：多路并进 —— 「堵源头」+「全量签名取证」，不再只赌一条路
+//
+// 🔥 v0.2.5 为什么还是刷脸（证据 + 推断）：
+//   v0.2.5 的闸门只挂「零参数 BOOL 查询」方法。但 v0.2.2 侦查日志显示
+//   `SBUIBiometricResource` 上的匹配相关方法**全都带参数**：
+//       _addMatchingAssertion: / _removeMatchingAssertion: / _activateMatchAssertion:
+//       acquireMatchingAssertionWithMode:reason: / resumeMatchingForAssertion:advisory:
+//       _reallyResumeMatchingForAssertion:advisory: / resumeMatchingAdvisory:
+//   ⇒ 那次侦查**只筛「以 : 结尾」的 setter**，压根没看零参数方法。
+//     所以闸门很可能**一个都没挂上** → 没生效 → 还是刷脸。
+//
+// 本版三路并进：
+//   路 A【堵源头】挂钩**已知存在**的断言方法，假空间期间让它们空操作。
+//        不添加断言 = 不开始匹配。方法名**全部来自真实侦查日志**，不是猜的。
+//   路 B【全量签名取证】把 Biometric 相关类的**所有方法签名**打进日志，
+//        下一轮就能直接看到真实的零参数查询方法名。
+//   路 C【保留闸门】v0.2.5 的零参数 BOOL 闸门继续挂。
+//   + 保留 Mesa 回调兜底（已知一定被调用）。
+//
+// ⚠️ 安全：路 A 只做「空操作」，不改参数、不崩；非假空间期间 100% 转原实现。
+// ---------------------------------------------------------------------------
+
+// ---- 路 A：断言方法「空操作化」----
+static NSMutableDictionary<NSString *, NSValue *> *gDLAssertOrig = nil;
+static NSMutableSet<NSString *> *gDLAssertInstalled = nil;
+
+// 断言方法名（**全部来自 v0.2.2 真实侦查日志**，非猜测）
+static NSArray<NSString *> *DLAssertSelectorNames(void) {
+    static NSArray<NSString *> *a = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        a = @[
+            @"_addMatchingAssertion:",
+            @"_activateMatchAssertion:",
+            @"acquireMatchingAssertionWithMode:reason:",
+            @"resumeMatchingAdvisory:",
+            @"_reallyResumeMatchingForAssertion:advisory:",
+            @"resumeMatchingForAssertion:advisory:",
+        ];
+    });
+    return a;
+}
+
+// 断言方法替换：假空间期间「什么都不做」，否则转原实现。
+// ⚠️ 必须**原样转发参数** —— 传 nil 可能破坏系统行为。
+//    按参数个数分成 3 个具体函数（0/1/2 个对象参数），签名精确，安全。
+
+static void DLAssertSuppress0(id self, SEL _cmd) {
+    if (DLShouldBlockBiometricMatching()) {
+        DLNoteBiometricGateHit(NSStringFromClass(object_getClass(self)),
+                               NSStringFromSelector(_cmd));
+        return;
+    }
+    NSString *key = [NSString stringWithFormat:@"%@|%@",
+                     NSStringFromClass(object_getClass(self)), NSStringFromSelector(_cmd)];
+    IMP imp = (IMP)[gDLAssertOrig[key] pointerValue];
+    if (imp) ((void (*)(id, SEL))imp)(self, _cmd);
+}
+static void DLAssertSuppress1(id self, SEL _cmd, id a) {
+    if (DLShouldBlockBiometricMatching()) {
+        DLNoteBiometricGateHit(NSStringFromClass(object_getClass(self)),
+                               NSStringFromSelector(_cmd));
+        return;
+    }
+    NSString *key = [NSString stringWithFormat:@"%@|%@",
+                     NSStringFromClass(object_getClass(self)), NSStringFromSelector(_cmd)];
+    IMP imp = (IMP)[gDLAssertOrig[key] pointerValue];
+    if (imp) ((void (*)(id, SEL, id))imp)(self, _cmd, a);
+}
+static void DLAssertSuppress2(id self, SEL _cmd, id a, id b) {
+    if (DLShouldBlockBiometricMatching()) {
+        DLNoteBiometricGateHit(NSStringFromClass(object_getClass(self)),
+                               NSStringFromSelector(_cmd));
+        return;
+    }
+    NSString *key = [NSString stringWithFormat:@"%@|%@",
+                     NSStringFromClass(object_getClass(self)), NSStringFromSelector(_cmd)];
+    IMP imp = (IMP)[gDLAssertOrig[key] pointerValue];
+    if (imp) ((void (*)(id, SEL, id, id))imp)(self, _cmd, a, b);
+}
+
+// 按参数个数选替换函数
+static IMP DLAssertReplacementForArity(unsigned int nargs) {
+    if (nargs == 0) return (IMP)DLAssertSuppress0;
+    if (nargs == 1) return (IMP)DLAssertSuppress1;
+    if (nargs == 2) return (IMP)DLAssertSuppress2;
+    return NULL;            // 3 个以上参数：不挂（极罕见，宁可不挂也不乱传）
+}
+
+static void DLAssertSuppressInstallOnClass(Class c) {
+    @try {
+        if (!c) return;
+        if (!gDLAssertOrig) {
+            gDLAssertOrig = [NSMutableDictionary dictionary];
+            gDLAssertInstalled = [NSMutableSet set];
+        }
+        NSString *cn = NSStringFromClass(c);
+        if (!cn.length || [gDLAssertInstalled containsObject:cn]) return;
+        [gDLAssertInstalled addObject:cn];
+
+        NSArray<NSString *> *names = DLAssertSelectorNames();
+        int hooked = 0;
+        for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
+            for (NSString *selName in names) {
+                SEL s = NSSelectorFromString(selName);
+                if (!s) continue;
+                Method m = class_getInstanceMethod(cur, s);
+                if (!m) continue;
+                char *ret = method_copyReturnType(m);
+                BOOL isVoid = (ret && ret[0] == 'v');
+                free(ret);
+                if (!isVoid) continue;
+
+                unsigned int nargs = method_getNumberOfArguments(m) - 2;
+                IMP repl = DLAssertReplacementForArity(nargs);
+                if (!repl) continue;        // 3 参以上：宁可不挂
+
+                NSString *key = [cn stringByAppendingFormat:@"|%@", selName];
+                if (gDLAssertOrig[key]) continue;
+
+                IMP old = NULL;
+                MSHookMessageEx(c, s, repl, &old);
+                if (old) {
+                    gDLAssertOrig[key] = [NSValue valueWithPointer:(void *)old];
+                    hooked++;
+                    DLProbe(@"[FaceID][堵源] 已挂断言方法：%@ -%@（%u 参，定义在 %@）→ "
+                            @"假空间期间空操作", cn, selName, nargs,
+                            NSStringFromClass(cur));
+                }
+            }
+        }
+        if (hooked) DLProbe(@"[FaceID][堵源] %@：共挂 %d 个断言方法", cn, hooked);
+    } @catch (__unused NSException *e) { }
+}
+
+// ---- 路 B：全量方法签名取证 ----
+static void DLBiometricSignatureDump(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    if (!DLIsSpringBoard()) return;
+
+    NSArray<NSString *> *targets = @[
+        @"SBUIBiometricResource", @"SBUIPasscodeBiometricResource",
+        @"SBLockScreenBiometricAuthenticationCoordinator",
+        @"SBDashBoardBiometricUnlockController",
+        @"SBUIPasscodeBiometricAuthenticationView",
+        @"SBUIBiometricEventMonitor",
+    ];
+    for (NSString *tn in targets) {
+        Class c = NSClassFromString(tn);
+        if (!c) { DLProbe(@"[FaceID][签名] %@ 不存在", tn); continue; }
+        NSMutableArray<NSString *> *zeroBool = [NSMutableArray array];
+        NSMutableArray<NSString *> *others   = [NSMutableArray array];
+        for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(cur, &mc);
+            if (!ms) continue;
+            for (unsigned int i = 0; i < mc; i++) {
+                NSString *sn = NSStringFromSelector(method_getName(ms[i]));
+                char *rt = method_copyReturnType(ms[i]);
+                char rc = rt ? rt[0] : '?';
+                free(rt);
+                unsigned int na = method_getNumberOfArguments(ms[i]) - 2;
+                if (na == 0 && (rc == 'c' || rc == 'B'))
+                    [zeroBool addObject:[NSString stringWithFormat:@"%@/%c", sn, rc]];
+                else if (na == 0)
+                    [others addObject:[NSString stringWithFormat:@"%@/%c", sn, rc]];
+            }
+            if (ms) free(ms);
+        }
+        DLProbe(@"[FaceID][签名] %@：零参数 BOOL %lu 个 → %@", tn,
+                (unsigned long)zeroBool.count,
+                zeroBool.count ? [zeroBool componentsJoinedByString:@", "] : @"（无）");
+        DLProbe(@"[FaceID][签名] %@：其它零参数 %lu 个 → %@", tn,
+                (unsigned long)others.count,
+                others.count ? [others componentsJoinedByString:@", "] : @"（无）");
+    }
+    DLProbe(@"[FaceID][签名] 全量签名取证完成（下一轮据此精确挂钩）");
 }
 
 // ---------------------------------------------------------------------------
