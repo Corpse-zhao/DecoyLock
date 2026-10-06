@@ -642,6 +642,41 @@ jobs:
           print("✅ 版本号单一来源（DL_VERSION），日志/面板无硬编码残留")
           PY
 
+          echo "--- 检查 21：⭐ 文件作用域 static 变量禁止「声明了却没用」（-Werror 会直接挂）---"
+          # v0.2.2 血泪：sBioWasMatching / sBioWasMatchingValid 声明后未接线，
+          #   Theos 默认 -Werror → `error: unused variable [-Werror,-Wunused-variable]`
+          #   直接让 Build package 挂掉。本地 check_objc/预检当时只看「结构」不看
+          #   「有没有人用」，形成盲区；这里补上。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys, glob
+
+          bad = 0
+          for path in sorted(glob.glob('*.m')):
+              raw = io.open(path, encoding='utf-8', errors='replace').read()
+              # 剥掉注释和字符串，避免文案里的同名词干扰
+              t = re.sub(r'/\*.*?\*/', '', raw, flags=re.S)
+              t = re.sub(r'//[^\n]*', '', t)
+              t = re.sub(r'"(?:\\.|[^"\\])*"', '""', t)
+              lines = t.splitlines()
+              for i, l in enumerate(lines, 1):
+                  if not l or l[0].isspace():
+                      continue
+                  m = re.match(r'static\s+(?:const\s+)?.*?\b(\w+)\s*(?:=[^;]*)?;\s*$', l)
+                  if not m:
+                      continue
+                  if '(' in l and '=' not in l:
+                      continue
+                  name = m.group(1)
+                  pat = re.compile(r'(?<![\w])' + re.escape(name) + r'(?![\w])')
+                  if not any(j != i and pat.search(o) for j, o in enumerate(lines, 1)):
+                      print("❌ %s 第 %d 行的 static 变量 `%s` 声明后从未使用" % (path, i, name))
+                      print("   → Theos 的 -Werror,-Wunused-variable 会直接让编译失败")
+                      bad = 1
+          if bad:
+              sys.exit(1)
+          print("✅ 无「声明了却没用」的文件作用域 static 变量")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

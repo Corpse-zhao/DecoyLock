@@ -229,11 +229,10 @@ void DLProbeClear(void) {
 // 我们当前是否处于「已暂停生物识别匹配」的状态（供兜底守护查询）
 static BOOL sBioMatchingOff = NO;
 
-// ⭐ v0.2.1：干预前记录「系统原本是否在匹配」，作为恢复时的兜底依据。
-//    为什么需要：万一我们的暂停成功了、但恢复路径全部没走到，
-//    下次进程内还能凭这个值把系统还原回去（不可让用户能力被永久关死）。
-static BOOL sBioWasMatching = NO;
-static BOOL sBioWasMatchingValid = NO;
+// 注：v0.2.1 曾引入 sBioWasMatching / sBioWasMatchingValid（记录干预前系统是否在匹配），
+// 但 v0.2.2 改成运行时侦查后没有用到它们 —— 留着会被 -Werror,-Wunused-variable 拦下编译。
+// 现在「系统原本开不开匹配」这件事由 sBioMatchingOff 的幂等状态 + DLResumeBiometric()
+// 的显式恢复保证，不需要额外的基线记录。故已删除。
 
 BOOL DLBiometricMatchingIsOff(void) { return sBioMatchingOff; }
 
