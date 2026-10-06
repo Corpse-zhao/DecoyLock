@@ -1595,6 +1595,14 @@ static void DLLogInputCapture(NSString *src) {
 - (void)passcodeLockViewPasscodeEnteredViaMesa:(id)mesa {
     DLProbe(@"[Mesa] ⭐ passcodeLockViewPasscodeEnteredViaMesa: 被调用（Face ID 解锁成功路径）");
 
+    // ⭐⭐⭐ v0.2.4 取证：**在刷脸发生的这一刻**清点窗口。
+    //   用户 v0.2.3 反馈「必须先刷脸才能看到假空间」——
+    //   若假空间是被「Face ID 提示层」盖住的，那么这一刻的窗口清单里
+    //   必然有一个层级高于假空间的可见窗口。这是抓现行的唯一时机。
+    if (DLEnabled() && [DLDecoyController isShowing]) {
+        DLDecoyDumpWindowsAroundFaceID(@"Mesa 刷脸瞬间");
+    }
+
     // 判据：只有「假空间正在以贴纸形态展示」时才拦 —— 其余一律放行，绝不影响正常使用。
     if (DLEnabled() && [DLDecoyController isShowing] && DLPinnedToLockScreen()) {
         DLProbe(@"★★ [锁屏贴纸] 拦截 Mesa（Face ID）解锁成功回调 → **真机保持锁定、不刷脸**");

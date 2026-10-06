@@ -390,6 +390,146 @@ static NSArray<id> *DLBioInstancesFor(NSString *ownerClassName, NSString *instCl
     return insts;
 }
 
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐⭐ v0.2.4：KVC 快速通道 —— 直接读写 `_matchingEnabled` 这个 **ivar**
+//
+// 🔥 来源（不是猜的）：TheAppleWiki · Dev:BiometricKit.framework 给出的实测代码：
+//     _wasMatching = [[monitor valueForKey:@"_matchingEnabled"] boolValue];
+//     [monitor _setMatchingEnabled:YES];
+//   → 注意 `_matchingEnabled` 是用 **KVC `valueForKey:` 读**的，
+//     说明它在 `SBUIBiometricEventMonitor` 上是**实例变量（ivar）**，
+//     而不是一定有 getter/setter 方法！
+//
+// 🔥🔥 为什么这条路值得单列（v0.2.0~v0.2.3 一路踩坑的根因）：
+//   v0.2.1 试 `respondsToSelector:@selector(setMatchingEnabled:)` → 真机说「没有」；
+//   v0.2.2 改「运行时侦查 + respondsToSelector」→ 侦查到 14 条候选，
+//     但**没有一条**能安全调用（多是需要对象参数的断言机制）。
+//   而 `respondsToSelector:` **只能回答「有没有这个方法」** ——
+//     如果系统用的是 **ivar + 直接赋值**（没有 setter），
+//     那么无论我把候选清单列多长，`respondsToSelector:` 一律返回 NO → 永远调不到。
+//
+//   KVC `setValue:forKey:` 走的是 **accessInstanceVariablesDirectly** 那条路：
+//     先找 setter，找不到就**直接写 ivar**（`_matchingEnabled` → `_matchingEnabled`）。
+//     → 这是唯一能绕过「没有 setter」这个死结的手段。
+//
+// ⚠️ 安全约束：
+//   1. 全程 @try/@catch 包裹 —— KVC 写不存在的 key 会抛 NSUnknownKeyException；
+//   2. **先读后写**：读得到（说明这个 key 真实存在）才写，避免瞎写；
+//   3. 读取结果写进日志 —— 这是「这台机器到底有没有这个开关」的铁证。
+// ---------------------------------------------------------------------------
+static id DLBioKVCInstance(void) {
+    // 候选持有者（按可靠度排序）
+    //   ① BiometricKit.manager.delegate  —— 文档实测就是 SBUIBiometricEventMonitor
+    //   ② SBUIBiometricEventMonitor sharedInstance
+    //   ③ SBUIBiometricResource sharedInstance
+    NSMutableArray<id> *cands = [NSMutableArray array];
+
+    Class bk = objc_getClass("BiometricKit");
+    if (bk) {
+        SEL msel = NSSelectorFromString(@"manager");
+        if ([bk respondsToSelector:msel]) {
+            @try {
+                id mgr = ((id (*)(id, SEL))objc_msgSend)(bk, msel);
+                if (mgr) {
+                    [cands addObject:mgr];
+                    SEL dsel = NSSelectorFromString(@"delegate");
+                    if ([mgr respondsToSelector:dsel]) {
+                        id d = ((id (*)(id, SEL))objc_msgSend)(mgr, dsel);
+                        if (d) [cands insertObject:d atIndex:0];   // 文档实测：它才是 monitor
+                    }
+                }
+            } @catch (__unused NSException *e) { }
+        }
+    }
+    for (NSString *cn in @[@"SBUIBiometricEventMonitor", @"SBUIBiometricResource"]) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        SEL ssel = NSSelectorFromString(@"sharedInstance");
+        if (![c respondsToSelector:ssel]) continue;
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(c, ssel);
+            if (v) [cands addObject:v];
+        } @catch (__unused NSException *e) { }
+    }
+    for (id c in cands) {
+        if ([c respondsToSelector:NSSelectorFromString(@"valueForKey:")]) return c;
+    }
+    return nil;
+}
+
+// 返回值：YES = 这条快速通道已处理（无论是否真的写成功），NO = 没走到
+static BOOL DLBioTryKVCPath(BOOL want) {
+    static BOOL sKVCLogged = NO;      // 只在首次把「探测结论」写进日志
+    static NSCountedSet *sKVCHits = nil;   // 记录哪些 key 真的读写成功过
+    if (!sKVCHits) sKVCHits = [NSCountedSet set];
+
+    // `_matchingEnabled` 是 TheAppleWiki 实测的 ivar 名；再带几个常见变体兜底。
+    // ⚠️ 顺序即优先级：先试文档证实的那个。
+    NSArray<NSString *> *keys = @[ @"_matchingEnabled", @"matchingEnabled" ];
+
+    id inst = DLBioKVCInstance();
+    if (!inst) {
+        if (!sKVCLogged) {
+            sKVCLogged = YES;
+            DLProbe(@"[FaceID][KVC] 拿不到 BiometricKit.manager.delegate / "
+                    @"SBUIBiometricEventMonitor / SBUIBiometricResource 任一实例 → "
+                    @"本条路径不可用（继续走运行时侦查）");
+        }
+        return NO;
+    }
+
+    NSString *instCls = NSStringFromClass([inst class]);
+    BOOL handled = NO;
+
+    for (NSString *k in keys) {
+        @try {
+            // ---- 第一步：先读。读不到就是「这个 key 不存在」，立刻换下一个 ----
+            id cur = [inst valueForKey:k];
+            if (cur == nil) continue;
+
+            // ---- 第二步：读到了 → 这个 key 真实存在 ----
+            if (!sKVCLogged) {
+                sKVCLogged = YES;
+                DLProbe(@"[FaceID][KVC] ✅ 命中！%@ 上有 KVC 键 `%@`（当前值=%@）→ "
+                        @"这正是一直没找到的匹配开关（它可能是 ivar，没有 setter）",
+                        instCls, k, cur);
+            }
+            [sKVCHits addObject:k];
+
+            // ---- 第三步：写目标值 ----
+            BOOL curBool = [cur respondsToSelector:@selector(boolValue)] ? [cur boolValue] : NO;
+            if (curBool == want) {          // 已经是目标状态 → 不写（幂等，避免抖动）
+                handled = YES;
+                break;
+            }
+            [inst setValue:@(want) forKey:k];
+            handled = YES;
+
+            // ⭐ v0.2.4：写后**立刻回读验证** —— 系统可能拒绝写入（只读属性/被 KVO 拦下），
+            //    不回读就只是「我以为我改了」，正是 v0.2.0~v0.2.3 反复翻车的模式。
+            id after = [inst valueForKey:k];
+            BOOL afterBool = [after respondsToSelector:@selector(boolValue)] ? [after boolValue] : NO;
+            DLProbe(@"[FaceID] 已%@生物识别匹配（KVC %@.%@：%@ → %@）%@",
+                    want ? @"恢复" : @"暂停", instCls, k, cur, after,
+                    (afterBool == want) ? @"✅ 写入生效" : @"⚠️ 写入被系统拒绝（值没变）");
+            break;
+        } @catch (NSException *e) {
+            // KVC 写不存在的 key 会抛 NSUnknownKeyException → 换下一个 key
+            continue;
+        }
+    }
+
+    if (handled) return YES;
+
+    if (!sKVCLogged) {
+        sKVCLogged = YES;
+        DLProbe(@"[FaceID][KVC] ⚠️ %@ 上试过 %@ 都不存在 → 本条路径不可用"
+                @"（继续走运行时侦查）",
+                instCls, [keys componentsJoinedByString:@", "]);
+    }
+    return NO;
+}
+
 void DLSetBiometricMatching(BOOL enabled) {
     // ⭐ 幂等短路：状态没变直接返回（不重复调系统 API，避免匹配抖动）
     if (enabled && !sBioMatchingOff) return;
@@ -397,6 +537,15 @@ void DLSetBiometricMatching(BOOL enabled) {
 
     BOOL want = enabled;                       // 目标状态
     BOOL wantOff = !enabled;
+
+    // ⭐⭐⭐⭐ v0.2.4 第 0 优先级：KVC 直写 ivar（唯一能绕过「没有 setter」的手段）
+    //   放在运行时侦查**之前** —— 这条路一旦走通，就不需要枚举 73 个类了。
+    @try {
+        if (DLBioTryKVCPath(want)) {
+            sBioMatchingOff = wantOff;
+            return;
+        }
+    } @catch (__unused NSException *e) { }
 
     // ⭐⭐⭐ v0.2.2：**不再手写候选清单**，改为「运行时自动侦查」。
     //
@@ -412,6 +561,11 @@ void DLSetBiometricMatching(BOOL enabled) {
     //   ⑤ 把**侦查到的东西**写进日志 —— 无论成功失败，下一轮都不用再猜。
     static NSMutableArray<NSString *> *sBioSetters = nil;   // 命中的 (类名, 选择器) 组合
     static BOOL sBioReconDone = NO;
+
+    // ⭐ v0.2.4：日志去重标记 —— v0.2.3 日志里「匹配断言」提示 + 总结各打了两组。
+    //   声明在函数**靠前**位置（C 的「先声明后用」是硬错误，见 SKILL 的 static_var_order）。
+    static BOOL sBioAssertionLogged = NO;
+    static BOOL sBioNoTargetLogged = NO;
 
     if (!sBioReconDone) {
         sBioReconDone = YES;
@@ -468,10 +622,25 @@ void DLSetBiometricMatching(BOOL enabled) {
                             for (unsigned int k = 0; mlist && k < mc; k++) {
                                 NSString *sn = NSStringFromSelector(method_getName(mlist[k]));
                                 if (!sn.length) continue;
-                                if (![sn hasSuffix:@":"]) continue;         // 要带参数
-                                if ([sn rangeOfString:@"Matching"].location == NSNotFound &&
-                                    [sn rangeOfString:@"Enabled"].location == NSNotFound &&
-                                    [sn rangeOfString:@"Match"].location == NSNotFound) continue;
+                                // ⭐ v0.2.4：**不再要求「必须带参数」**。
+                                //   血泪：v0.2.2/v0.2.3 的筛选条件是 `hasSuffix:@":"`，
+                                //   于是 `_startMatching` / `_stopMatching` / `_cancelMatching`
+                                //   这类**无参开关**被整体排除在候选之外 ——
+                                //   而它们恰恰最像「总开关」。
+                                //   TheAppleWiki 的实测代码里 `_startMatching` 就是无参的。
+                                //
+                                // ⭐ v0.2.4：语义词表也扩大 —— 补上 Assertion / Suspend /
+                                //   Disable / Stop / Cancel / Resume（这些才是真正的开关动词）。
+                                NSArray<NSString *> *words = @[
+                                    @"Matching", @"Match", @"Enabled", @"Enable",
+                                    @"Disable", @"Assertion", @"Suspend", @"Stop",
+                                    @"Cancel", @"Resume", @"Prearm", @"Biometric",
+                                ];
+                                BOOL hit = NO;
+                                for (NSString *w in words) {
+                                    if ([sn rangeOfString:w].location != NSNotFound) { hit = YES; break; }
+                                }
+                                if (!hit) continue;
                                 if (![hits containsObject:sn]) [hits addObject:sn];
                             }
                             if (mlist) free(mlist);
@@ -513,9 +682,15 @@ void DLSetBiometricMatching(BOOL enabled) {
                     return (sa > sb) ? NSOrderedAscending : NSOrderedDescending;
                 }];
 
-                DLProbe(@"[FaceID][侦查] 共找到 %lu 条候选，按语义排序后前 5 名：",
+                // ⭐ v0.2.4：**打印全部候选**，不再只打前 5 名。
+                //   血泪：v0.2.3 只打了前 5 名，用户回传日志后我拿不到完整清单，
+                //   只能看到「第 1 名 = _removeMatchingAssertion:」，
+                //   剩下 9 条是什么完全不知道 → 排查又得再等一轮真机日志。
+                //   侦查日志的唯一价值就是「一次性把机器上的可能性全列出来」，
+                //   截断它就等于白侦查。
+                DLProbe(@"[FaceID][侦查] 共找到 %lu 条候选，按语义排序（全部列出）：",
                         (unsigned long)sBioSetters.count);
-                for (NSUInteger i = 0; i < MIN((NSUInteger)5, sBioSetters.count); i++) {
+                for (NSUInteger i = 0; i < sBioSetters.count; i++) {
                     NSArray<NSString *> *p = [sBioSetters[i] componentsSeparatedByString:@"|"];
                     if (p.count >= 4) {
                         DLProbe(@"[FaceID][侦查]   第 %lu 名 分数=%d  %@ (%@) -%@",
@@ -582,18 +757,38 @@ void DLSetBiometricMatching(BOOL enabled) {
             //    日志实锤本机 `_removeMatchingAssertion:` 存在。
             //    但移除需要传入「当初那个断言对象」，我们并没有 —— 所以这里**不硬调**，
             //    只在能确定参数合法性时尝试，否则交给下一步（LD 层 hook）。
+            //
+            // 🔥🔥 v0.2.4 修正重复日志：v0.2.3 用户日志里这条提示打了**两组**
+            //   （16.143 与 16.789 各一组），根因是这里的 `break` **只跳出了内层
+            //   `for (id inst ...)` 循环**，外层的 `for (NSString *entry in sBioSetters)`
+            //   仍在继续遍历 → 每一条断言类候选都打一次，整组提示被重复输出。
+            //
+            //   修法：① 用独立 static 标记，整组提示**全局只打一次**；
+            //         ② 用 goto 出整个双层循环 —— 已经确定「本机是断言机制」之后，
+            //            再继续遍历剩下的 9 条候选没有任何意义（结论不会变）。
             if ([selName rangeOfString:@"Assertion"].location != NSNotFound) {
-                DLProbe(@"[FaceID][侦查] ⚠️ 本机开关是「匹配断言」机制（%@ -%@），"
-                        @"需要断言对象才能操作 → 本次未直接调用，改由 hook 层拦截",
-                        instCls, selName);
-                break;
+                if (!sBioAssertionLogged) {
+                    sBioAssertionLogged = YES;
+                    DLProbe(@"[FaceID][侦查] ⚠️ 本机开关是「匹配断言」机制"
+                            @"（例：%@ -%@），需要断言对象才能操作 → "
+                            @"本次未直接调用，改由 hook 层拦截",
+                            instCls, selName);
+                }
+                goto done_calling;      // ← 跳出**整个**双层循环，不再重复
             }
         }
     }
 
-    DLProbe(@"[FaceID] ⚠️ 侦查到 %lu 条候选，但没有一条能「确定参数形状」地安全调用"
-            @"（多为断言机制，需要对象参数）→ 生物识别未被直接停用",
-            (unsigned long)sBioSetters.count);
+done_calling:
+
+    // ⭐ v0.2.4：这条总结同样**只打一次** —— v0.2.3 日志里它跟着上面那条断言的
+    //   提示一起重复输出，造成整组 4 行日志出现两遍（16.143 / 16.789）。
+    if (!sBioNoTargetLogged) {
+        sBioNoTargetLogged = YES;
+        DLProbe(@"[FaceID] ⚠️ 侦查到 %lu 条候选，但没有一条能「确定参数形状」地安全调用"
+                @"（多为断言机制，需要对象参数）→ 生物识别未被直接停用",
+                (unsigned long)sBioSetters.count);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -632,6 +632,51 @@ static NSArray<UIWindow *> *DLAllWindows(void) {
     return all;
 }
 
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐ v0.2.4 取证：把「刷脸那一刻」的窗口现场完整打出来
+//
+// 🔥 为什么需要它（用户 v0.2.3 反馈：「必须先刷脸才能看到假空间」）：
+//   假空间在 16.789 就呈现了（level=1051 > 锁屏 1050），日志里锁屏也一直
+//   hidden=0。**按理说用户应该立刻看到假空间** —— 但他必须先刷脸。
+//   推论只剩一个：**呈现的这一刻，有别的可见窗口盖在假空间上面**，
+//   而那个窗口（很可能是 Face ID 提示层）在刷脸结束后才消失。
+//
+//   验证它只需要一次现场快照 —— 这就是本函数。
+//
+// ⚠️ 只读不改：绝不动任何窗口，纯粹取证。
+// ---------------------------------------------------------------------------
+FOUNDATION_EXPORT void DLDecoyDumpWindowsAroundFaceID(NSString *why) {
+    @try {
+        UIWindow *mine = sWindow;   // 自建窗口（静态强持有）
+        UIWindowScene *myScene = mine.windowScene;
+
+        DLProbe(@"★★ [取证·%@] 假空间 level=%.0f hidden=%d scene=%p",
+                why ?: @"?", mine ? mine.windowLevel : -1.0,
+                mine ? (int)mine.hidden : -1, (void *)myScene);
+
+        CGFloat myLevel = mine ? mine.windowLevel : -1.0;
+        NSInteger above = 0;
+        for (UIWindow *w in DLAllWindows()) {
+            if (!w || w == mine) continue;
+            if (w.hidden) continue;                       // 只看可见的
+            if (w.windowScene != myScene) continue;       // 只比同一个 scene（跨 scene 比层级无意义）
+            NSString *cls = NSStringFromClass(object_getClass(w));
+            if (w.windowLevel >= myLevel) {
+                above++;
+                DLProbe(@"★★ [取证·%@] ⚠️ 压在我上面的可见窗口：%@ level=%.0f key=%d",
+                        why ?: @"?", cls, w.windowLevel, (int)w.isKeyWindow);
+            }
+        }
+        if (above == 0) {
+            DLProbe(@"★★ [取证·%@] 同 scene 内没有可见窗口压在我上面 → "
+                    @"假空间此刻本应可见（若用户仍看不到，问题不在窗口层级）", why ?: @"?");
+        } else {
+            DLProbe(@"★★ [取证·%@] 共 %ld 个可见窗口压在我上面 → **这就是看不到假空间的成因**",
+                    why ?: @"?", (long)above);
+        }
+    } @catch (__unused NSException *e) { }
+}
+
 // 拆窗口的**唯一出口**：hidden + 清 rootViewController + 摘 windowScene。
 // 三件事必须一起做 —— 少做任何一件，都可能留下一个「看得见锁屏、却点不动」的挡板。
 static void DLTeardownWindow(UIWindow *win) {
@@ -890,8 +935,48 @@ static void DLBioGuardTick(NSInteger gen) {
 
     sPresentFailCount = 0;   // 成功一次就清零
     sShownAt = CFAbsoluteTimeGetCurrent();   // ⭐ v0.1.19：记录展示起点
-    DLProbe(@"decoy 已呈现 windowLevel=%.0f scene=%d key=%d（不抢 key window）",
-            win.windowLevel, (int)(win.windowScene != nil), (int)win.isKeyWindow);
+
+    // ⭐⭐⭐ v0.2.4：呈现日志升级 —— `scene=%d` 是个**布尔**（`win.windowScene != nil`），
+    //   只能告诉你「挂上了 scene」，**无法回答「挂的是不是锁屏那个 scene」**。
+    //   用户 v0.2.3 反馈「必须先刷脸才能看到假空间」——而「假空间挂错 scene
+    //   → 与锁屏不在同一个合成上下文 → 层级再高也不显示」正是最可能的成因之一。
+    //   所以这里把 scene 的**真实身份**打出来，并和「锁屏窗口所在 scene」逐字比对。
+    UIWindowScene *myScene = win.windowScene;
+    UIWindowScene *lockScene = DLSceneOwningLockScreen();
+    DLProbe(@"decoy 已呈现 windowLevel=%.0f scene挂载=%d key=%d（不抢 key window）",
+            win.windowLevel, (int)(myScene != nil), (int)win.isKeyWindow);
+    DLProbe(@"★★ [取证] 我挂的 scene=%p（activation=%ld）· 锁屏的 scene=%p · 同一个=%@",
+            (void *)myScene, myScene ? (long)myScene.activationState : -1L,
+            (void *)lockScene,
+            (myScene && lockScene && myScene == lockScene) ? @"✅ 是" : @"❌ 否（这就是看不到假空间的成因）");
+
+    // ⭐⭐⭐ v0.2.4：**呈现之后**再清点一次窗口。
+    //   血泪：v0.2.2/v0.2.3 只在**呈现前**（topBefore）清点过一次，
+    //   于是「呈现那一刻到底什么窗口压在我上面」这个问题从来没有答案 ——
+    //   而那正是「假空间不可见」的直接线索。
+    //   现在前后各清点一次，把「压在我上面的可见窗口」逐条列出来。
+    @try {
+        DLProbe(@"★★ [取证] === 呈现后窗口清点（找我上面有什么）===");
+        DLMaxOtherWindowLevelVerbose(YES);
+        CGFloat highest = -1.0;
+        NSString *highestCls = nil;
+        for (UIWindow *w in DLAllWindows()) {
+            if (!w || w == sWindow || w.hidden) continue;       // 只看**可见**的
+            if (w.windowScene != myScene) continue;             // 只看**同一个 scene** 的
+            if (w.windowLevel > highest) {
+                highest = w.windowLevel;
+                highestCls = NSStringFromClass(object_getClass(w));
+            }
+        }
+        if (highestCls) {
+            DLProbe(@"★★ [取证] 同 scene 内**可见**窗口最高 = %.0f（%@）；我是 %.0f → %@",
+                    highest, highestCls, win.windowLevel,
+                    (win.windowLevel > highest) ? @"我在最上面 ✅" : @"我被压住了 ❌（会看不到）");
+        } else {
+            DLProbe(@"★★ [取证] 同 scene 内除我之外没有其它可见窗口 → 我必然可见 ✅");
+        }
+    } @catch (__unused NSException *e) { }
+
     if (win.isKeyWindow && sPrevKeyWindow) {
         DLProbe(@"[安全] ⚠️ 意外成为 key window → 立刻还给系统");
         DLRestoreKeyWindow();

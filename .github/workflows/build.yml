@@ -718,6 +718,60 @@ jobs:
           print("✅ 真实解锁路径已拦截（Mesa 回调 + 锁屏收场）")
           PY
 
+          echo "--- 检查 23：⭐⭐⭐⭐ KVC 停用路径 + 呈现/刷脸取证（v0.2.4）---"
+          # 两条血泪：
+          #   ① `respondsToSelector:` 只回答「有没有这个方法」—— 而 TheAppleWiki 实测
+          #      代码用的是 KVC `valueForKey:@"_matchingEnabled"`，说明它在
+          #      SBUIBiometricEventMonitor 上是 **ivar**（可能没有 setter）。
+          #      用 respondsToSelector 找它 → 永远返回 NO → v0.2.0~v0.2.3 连错三轮。
+          #   ② v0.2.2/v0.2.3 只在**呈现前**清点窗口 → 「呈现那一刻什么压在我上面」
+          #      从来没有记录 → 用户报「必须先刷脸才能看到假空间」时无从判断。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          common = io.open('DLCommon.m', encoding='utf-8', errors='replace').read()
+          # keep_strings 语义：只剥注释，保留字符串（断言目标都在字符串字面量里）
+          common_nc = re.sub(r'/\*.*?\*/', '', common, flags=re.S)
+          common_nc = re.sub(r'//[^\n]*', '', common_nc)
+
+          if '"_matchingEnabled"' not in common_nc:
+              print("❌ DLCommon.m 缺少 KVC 键名 `_matchingEnabled`")
+              print("   它是 ivar，KVC 是绕过「没有 setter」的唯一手段")
+              sys.exit(1)
+          if 'valueForKey:' not in common_nc:
+              print("❌ DLCommon.m 缺少 KVC 读（valueForKey:）")
+              sys.exit(1)
+          if 'setValue:' not in common_nc or 'forKey:' not in common_nc:
+              print("❌ DLCommon.m 缺少 KVC 写（setValue:forKey:）")
+              sys.exit(1)
+          if '写入被系统拒绝' not in common_nc:
+              print("❌ KVC 写入没有写后回读验证")
+              print("   不回读 = 无法发现「写入被系统拒绝」→ 又会白改一轮")
+              sys.exit(1)
+          if '前 5 名' in common_nc:
+              print("❌ 侦查日志仍在截断（「前 5 名」）—— 侦查日志必须一次列全")
+              sys.exit(1)
+
+          decoy = io.open('DLDecoyController.m', encoding='utf-8', errors='replace').read()
+          decoy_nc = re.sub(r'/\*.*?\*/', '', decoy, flags=re.S)
+          decoy_nc = re.sub(r'//[^\n]*', '', decoy_nc)
+          if '呈现后窗口清点' not in decoy_nc:
+              print("❌ DLDecoyController.m 缺少「呈现后窗口清点」取证")
+              print("   只在呈现前清点 = 永远看不到「什么压在我上面」")
+              sys.exit(1)
+          if 'DLDecoyDumpWindowsAroundFaceID' not in decoy_nc:
+              print("❌ DLDecoyController.m 缺少刷脸瞬间取证函数")
+              sys.exit(1)
+
+          twk = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          twk_nc = re.sub(r'/\*.*?\*/', '', twk, flags=re.S)
+          twk_nc = re.sub(r'//[^\n]*', '', twk_nc)
+          if 'DLDecoyDumpWindowsAroundFaceID' not in twk_nc:
+              print("❌ Tweak.x 的 Mesa 回调里没有调用刷脸瞬间取证")
+              sys.exit(1)
+          print("✅ KVC 停用路径 + 呈现/刷脸取证齐备")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

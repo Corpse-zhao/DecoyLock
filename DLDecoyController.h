@@ -32,6 +32,12 @@
 /// 用它把界面上看起来像「密码错了」，避免暴露插件。
 + (void)showFakeWrongFeedback;
 
+/// ⭐⭐⭐ v0.2.4 取证：清点窗口 + 逐条列出「压在我们上面的可见窗口」。
+/// 由 Tweak 在**刷脸发生的那一刻**（Mesa 回调）调用 ——
+/// 用于回答「为什么刷脸之前看不到假空间」（是不是被某个更高窗口盖住了）。
+/// @param why 触发原因（进日志，便于对齐时间线）
+FOUNDATION_EXPORT void DLDecoyDumpWindowsAroundFaceID(NSString *why);
+
 #pragma mark - ⭐ v0.1.14 主动取词：由 Tweak 直接询问「这串输入该怎么处理」
 
 typedef NS_ENUM(NSInteger, DLPasscodeVerdict) {
