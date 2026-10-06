@@ -241,6 +241,48 @@ jobs:
             echo "✅ 无重复 %hook 类"
           fi
 
+          echo "--- 检查 12：⭐⭐ 自建窗口禁止 makeKeyAndVisible（2026-10-06 锁屏卡死事故） ---"
+          # 事故复盘：用户反馈「正常输入密码界面点不动了」。
+          #   根因 = 自建的高层级窗口调了 makeKeyAndVisible，**把系统锁屏的 key window
+          #   抢走**；我们退出时只 hidden=YES，没把 key 还给系统 →
+          #   锁屏收不到触摸（看得见界面，点不动）。
+          #   正解：窗口要显示只需 hidden=NO + 层级够高，**根本不需要当 key window**。
+          if grep -vE '^[[:space:]]*(//|\*|/\*)' DLDecoyController.m \
+               | grep -nE 'makeKeyAndVisible'; then
+            echo "❌ DLDecoyController.m 里出现了 makeKeyAndVisible —— 会抢走锁屏的 key window，"
+            echo "   用户退出后密码界面会点不动。改用 win.hidden = NO;（见文件顶部三条铁律）"
+            FAIL=1
+          else
+            echo "✅ 自建窗口未抢 key window"
+          fi
+
+          echo "--- 检查 13：⭐ 锁屏消失/解锁成功时必须拆窗口（防「残留挡板」回归） ---"
+          # 自建窗口若在锁屏消失时没被拆掉，就会变成「看不见却挡触摸」的挡板。
+          # 必须存在 DLSafeTeardownIfStale 且至少在两个锁屏生命周期回调里被调用。
+          if ! grep -qE 'DLSafeTeardownIfStale' Tweak.x; then
+            echo "❌ 没有 DLSafeTeardownIfStale —— 锁屏消失时不会清理自建窗口，用户会被挡板卡住"
+            FAIL=1
+          else
+            N=$(grep -cE 'DLSafeTeardownIfStale\(' Tweak.x)
+            if [ "$N" -lt 3 ]; then
+              echo "❌ DLSafeTeardownIfStale 只被调用 $N 次（应覆盖 锁屏重建/锁屏消失/解锁成功 三处）"
+              FAIL=1
+            else
+              echo "✅ 锁屏生命周期清理已接上（$N 处）"
+            fi
+          fi
+
+          echo "--- 检查 14：⭐ 吞键（抑制系统提交）必须有保护阀 ---"
+          # 吞键是**唯一**能让用户键盘失效的机制。一旦误触发（伪密码被设成真实密码等），
+          # 用户就彻底解不开锁。必须有过频保护，宁可功能失效也不能锁死设备。
+          if grep -qE 'gDLSuppressOrig[[:space:]]*=[[:space:]]*YES' Tweak.x \
+             && ! grep -qE 'DLSafeToSuppress' Tweak.x; then
+            echo "❌ 有吞键逻辑但没有 DLSafeToSuppress 保护阀 —— 存在把用户锁在设备外的风险"
+            FAIL=1
+          else
+            echo "✅ 吞键有保护阀"
+          fi
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

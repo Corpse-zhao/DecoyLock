@@ -41,8 +41,8 @@
         },
         {
             "cell": "PSGroupCell",
-            "label": "假空间 App",
-            "footerText": "该界面由本插件独立绘制，不会真正打开任何应用。修改后需重启桌面（respring）生效。"
+            "label": "假空间 App 与退出",
+            "footerText": "这一页管两件事：上面勾选假空间里显示哪些 App；下面选「点哪个 App 退出」。修改后需重启桌面（respring）生效。"
         },
         {
             "cell": "PSLinkCell",
@@ -52,15 +52,12 @@
         {
             "cell": "PSGroupCell",
             "label": "退出方式",
-            "footerText": "在假空间里点选定的这个 App 即退出（默认「设置」）。若该 App 不在显示列表里，选中后会自动加入。"
+            "footerText": "在假空间里点下面选定的这个 App 即退出（默认「设置」）。若它没被勾选为显示，选中后会自动加入显示列表。"
         },
         {
-            "cell": "PSMultiValueSpecifier",
+            "cell": "PSLinkCell",
             "label": "点哪个 App 退出",
-            "key": "decoy_exit_app",
-            "default": "settings",
-            "titles": ["不设置（仅用隐藏手势）", "电话", "信息", "邮件", "Safari", "相机", "照片", "备忘录", "日历", "时钟", "天气", "设置", "地图", "音乐", "钱包", "文件", "健康"],
-            "values": ["", "phone", "message", "mail", "safari", "camera", "photos", "notes", "calendar", "clock", "weather", "settings", "maps", "music", "wallet", "files", "health"]
+            "action": "pushExitAppPicker:"
         },
         {
             "cell": "PSGroupCell",
@@ -85,7 +82,7 @@
         {
             "cell": "PSGroupCell",
             "label": "",
-            "footerText": "伪锁屏 v0.1.18 · 作者 板栗仁"
+            "footerText": "伪锁屏 v0.1.19 · 作者 板栗仁"
         }
     ]
 }

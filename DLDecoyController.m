@@ -34,6 +34,8 @@ static NSString *const kDLCellID = @"DLDecoyAppCell";
 + (void)startKeeper;
 + (void)keeperTick:(NSInteger)n;
 + (void)reviveOrPresent;
+// ⭐ v0.1.19：拆窗口的内部入口（userInitiated=NO 时不得污染 sUserDismissed）
++ (void)teardownDecoyUserInitiated:(BOOL)userInitiated;
 @end
 
 #pragma mark - 假 App 单元格
@@ -193,8 +195,44 @@ static CGFloat DLMaxOtherWindowLevel(void) {
 static BOOL sKeeperActive = NO;      // 守护循环是否在跑
 static BOOL sUserDismissed = NO;     // ⭐ v0.1.18：区分「系统弄没窗口」与「用户主动退出」
 
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.19 安全性重做（用户实测「正常输入密码界面点不动了」的根因修复）
+//
+// 事故链：
+//   ① 我们自建的窗口层级极高，并且调了 [win makeKeyAndVisible]
+//      → **把系统锁屏的 key window 抢走了**；
+//   ② 退出时只把窗口 hidden=YES，**没有把 key window 还给系统**
+//      → 锁屏再也接不到触摸（用户看到密码界面，但点键盘毫无反应）；
+//   ③ 更糟的一种：窗口 hidden 了但 rootViewController 没清干净 /
+//      或者残留窗口被守护循环复活成一个「透明窗口」→ 用户看得见锁屏，
+//      手指却全被它吃掉。
+//
+// 三条铁律（本项目后续所有自建窗口都必须遵守）：
+//   A. **绝不 makeKeyAndVisible** —— 只 hidden=NO。窗口要显示不需要当 key window。
+//   B. **拆窗口只有唯一出口 DLTeardownWindow()** —— hidden + 清 rootViewController
+//      + 摘 windowScene，三件事必须一起做，缺一个就可能留个透明挡板。
+//   C. **失败必须放行（fail-open）** —— 呈现连续失败就彻底放弃，把系统还给用户。
+// ---------------------------------------------------------------------------
+static UIWindow *sPrevKeyWindow = nil;     // 呈现前系统的 key window，退出时还回去
+static NSInteger sPresentFailCount = 0;    // 连续呈现失败次数
+static BOOL      sGaveUp = NO;             // 连续失败 → 彻底放弃干预（fail-open）
+static CFAbsoluteTime sShownAt = 0.0;      // ⭐ v0.1.19：本次呈现的时刻（算展示时长用）
+
+// 前向声明（定义在窗口工具函数区，这里先用）
+static void DLTeardownWindow(UIWindow *win);
+static void DLRestoreKeyWindow(void);
+static NSArray<UIWindow *> *DLAllWindows(void);
+
+
 + (DLPasscodeVerdict)handleCapturedPasscode:(NSString *)digits {
     if (!digits.length) return DLPasscodeVerdictNative;
+
+    // ⭐ v0.1.19 铁律 C：已放弃 → 一律走原生流程。
+    //    这就要求**返回 Native，从而不会去吞按键** —— 用户的键盘永远能用。
+    if (sGaveUp) {
+        DLProbe(@"[主动判定] 已放弃干预（fail-open）→ 放行");
+        return DLPasscodeVerdictNative;
+    }
 
     // ---- 前置门槛 ----
     if (!DLEnabled()) {
@@ -230,16 +268,20 @@ static BOOL sUserDismissed = NO;     // ⭐ v0.1.18：区分「系统弄没窗�
 
     // ⭐ v0.1.18：新一轮命中 → 解除「用户已退出」状态，守护循环重新待命
     sUserDismissed = NO;
+    sPresentFailCount = 0;    // ⭐ v0.1.19：新一次尝试，失败计数归零
 
     // 关键：双保险（v0.1.15 重做）。
     //   ① 立刻异步呈现（赶在系统「密码错误」动画之前把假空间铺上去）
-    //   ② 呈现后启动 15 秒守护循环：每 0.5 秒查一次，窗口被系统隐藏/移除
+    //   ② 呈现成功后启动 15 秒守护循环：每 0.5 秒查一次，窗口被系统隐藏/移除
     //      就当场复活。2026-10-06 实测：首次呈现 1.2 秒后窗口就没了
     //      （isShowing==NO），单次「补呈现」治标不治本，必须持续守护。
+    // ⚠️ v0.1.19：startKeeper 必须在 present**之后**调用。
+    //    旧代码是同步先 startKeeper —— 那一刻窗口还不存在，守护循环第 0 次
+    //    就误判「不可见」，白白计一次失败。
     dispatch_async(dispatch_get_main_queue(), ^{
         [DLDecoyController presentIfConfigured];
+        [DLDecoyController startKeeper];
     });
-    [DLDecoyController startKeeper];
 
     return DLPasscodeVerdictDecoy;
 }
@@ -279,8 +321,25 @@ static BOOL sUserDismissed = NO;     // ⭐ v0.1.18：区分「系统弄没窗�
         }
         DLProbe(@"[守护] 第 %ld 次检查：假空间不可见（%@）→ 立即复活",
                 (long)n, state);
+        // ⭐ v0.1.19：复活前先把残留拆干净（避免留下透明挡板）
+        if (!sShared || !sShared.view.window) {
+            [self teardownDecoyUserInitiated:NO];
+        }
+        sPresentFailCount++;
+        if (sPresentFailCount > 6) {
+            // 连续 6 次（3 秒）都拉不起来 → 说明这台设备上这条路根本走不通。
+            // 立刻放手，绝不继续折腾用户的锁屏（fail-open）。
+            sGaveUp = YES;
+            sKeeperActive = NO;
+            DLProbe(@"!!! [守护] 连续 %ld 次无法呈现 → 本轮放弃干预（fail-open）。"
+                    @"若你看到这行，说明插件在这台设备上无法工作，但锁屏不受影响。",
+                    (long)sPresentFailCount);
+            return;
+        }
         [self reviveOrPresent];
     } else if (sWindow) {
+        // 可见 → 失败计数清零（只有「持续不可见」才算失败）
+        sPresentFailCount = 0;
         // ⭐ v0.1.17：可见时也顺便检查层级 —— 系统可能在我们之后又拉了一个
         //    更高的窗口（例如锁屏重建），把我们压到下面去（用户就会看到
         //    「密码错误/刷脸」而不是假空间）。发现被压就立刻抬上去。
@@ -307,19 +366,22 @@ static BOOL sUserDismissed = NO;     // ⭐ v0.1.18：区分「系统弄没窗�
 }
 
 // 能复活就不重建（重建会闪一下黑屏）：
-//   窗口还在、只是被隐藏 → 直接重新可见 + makeKey
-//   窗口没了 / 实例没了  → 走完整重建
+//   窗口还在、只是被隐藏 → 直接重新可见
+//   窗口没了 / 实例没了  → 先彻底拆干净再重建
+// ⚠️ v0.1.19：这里**不再调 makeKeyAndVisible**（会抢走锁屏的 key window）。
 + (void)reviveOrPresent {
     if (sShared && sShared.view.window) {
         UIWindow *win = sShared.view.window;
-        if (win.hidden || ![win isKeyWindow]) {
-            DLProbe(@"[守护] 复活：窗口重新可见（level=%.0f）", win.windowLevel);
+        if (win.hidden) {
+            DLProbe(@"[守护] 复活：窗口重新可见（level=%.0f，不抢 key）", win.windowLevel);
             win.hidden = NO;
-            [win makeKeyAndVisible];
         }
         return;
     }
-    DLProbe(@"[守护] 复活失败：窗口/实例已丢失 → 完整重建");
+    DLProbe(@"[守护] 复活失败：窗口/实例已丢失 → 先拆干净再完整重建");
+    // ⚠️ 重建前必须把残留拆干净：否则旧的「透明窗口」留在层级上，
+    //    用户看得见锁屏却点不动（实测事故的成因之一）。
+    [self teardownDecoyUserInitiated:NO];
     [self presentIfConfigured];
 }
 
@@ -409,7 +471,76 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.19 窗口安全工具（三个函数，铁律 B/C 的落地）
+// ---------------------------------------------------------------------------
+
+// 收集当前进程里所有窗口（scene.windows + application.windows，去重）
+static NSArray<UIWindow *> *DLAllWindows(void) {
+    NSMutableArray<UIWindow *> *all = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (w && ![all containsObject:w]) [all addObject:w];
+            }
+        }
+    }
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w && ![all containsObject:w]) [all addObject:w];
+    }
+    return all;
+}
+
+// 拆窗口的**唯一出口**：hidden + 清 rootViewController + 摘 windowScene。
+// 三件事必须一起做 —— 少做任何一件，都可能留下一个「看得见锁屏、却点不动」的挡板。
+static void DLTeardownWindow(UIWindow *win) {
+    if (!win) return;
+    @try {
+        win.hidden = YES;
+        win.rootViewController = nil;
+        win.windowScene = nil;
+    } @catch (__unused NSException *e) { }
+}
+
+// 把 key window 还给系统。
+// ⚠️ 这是本次事故的核心修复点：我们呈现时**不再抢占 key window**，
+//    但历史版本抢过，退出时若不归还，锁屏键盘就会彻底点不动。
+//    所以这里既做「归还」，也做「兜底挑一个系统窗口设为 key」。
+static void DLRestoreKeyWindow(void) {
+    @try {
+        UIWindow *prev = sPrevKeyWindow;
+        sPrevKeyWindow = nil;
+        if (prev && prev.windowScene && !prev.hidden) {
+            [prev makeKeyWindow];
+            if (prev.isKeyWindow) {
+                DLProbe(@"[安全] key window 已归还给 %@", NSStringFromClass(object_getClass(prev)));
+                return;
+            }
+        }
+        // 兜底：挑现场「层级最高、可见、不是我们的」窗口设为 key
+        UIWindow *best = nil;
+        CGFloat bestLv = -1.0;
+        for (UIWindow *w in DLAllWindows()) {
+            if (!w || w.hidden || !w.windowScene) continue;
+            if (w.windowLevel > bestLv) { bestLv = w.windowLevel; best = w; }
+        }
+        if (best) {
+            [best makeKeyWindow];
+            DLProbe(@"[安全] 兜底把 key window 设为 %@", NSStringFromClass(object_getClass(best)));
+        } else {
+            DLProbe(@"[安全] 现场没有可用的系统窗口可设 key");
+        }
+    } @catch (__unused NSException *e) { }
+}
+
 + (void)presentIfConfigured {
+    // ⭐ v0.1.19 铁律 C：连续呈现失败 → 彻底放弃干预（fail-open）。
+    //    宁可功能不生效，也绝不能把用户的锁屏搞坏。
+    if (sGaveUp) {
+        DLProbe(@"decoy 跳过：本轮已因连续失败放弃干预（fail-open，重启桌面后恢复）");
+        return;
+    }
     if (!DLEnabled()) {
         DLProbe(@"decoy 跳过：插件未启用");
         return;
@@ -422,11 +553,14 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
         DLProbe(@"decoy 跳过：已在展示中");
         return;
     }
-    // 残留状态清掉（窗口被系统拆掉但 sShared 还没释放的兜底），
-    // 否则用户会「点进去一次之后再也没反应」
-    if (sShared) {
+    // 残留状态清掉（窗口被系统拆掉但 sShared/sWindow 还没释放的兜底），
+    // 否则用户会「点进去一次之后再也没反应」。
+    // ⚠️ v0.1.19：这里必须走「非用户主动」的拆除 —— 旧代码直接调 dismissDecoy，
+    //    而 dismissDecoy 会置 sUserDismissed=YES，把刚刚在 handleCapturedPasscode
+    //    里复位好的状态又改坏，导致守护循环立刻收工、窗口没人守 → 一闪就没。
+    if (sShared || sWindow) {
         DLProbe(@"decoy 清理残留实例");
-        [self dismissDecoy];
+        [self teardownDecoyUserInitiated:NO];
     }
 
     DLDecoyController *vc = [[DLDecoyController alloc] init];
@@ -438,6 +572,14 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
     //    并且层级要高过当时所有窗口（v0.1.17 修正，见上面两段说明）。
     UIWindow *win = nil;
     CGFloat topBefore = DLMaxOtherWindowLevelVerbose(YES);   // 顺便把所有窗口打进日志
+
+    // ⭐ v0.1.19：记下当前 key window，退出时还给它（详见 DLRestoreKeyWindow 注释）
+    sPrevKeyWindow = nil;
+    for (UIWindow *w in DLAllWindows()) {
+        if (w.isKeyWindow) { sPrevKeyWindow = w; break; }
+    }
+    DLProbe(@"[安全] 呈现前的 key window = %@",
+            sPrevKeyWindow ? NSStringFromClass(object_getClass(sPrevKeyWindow)) : @"(无)");
 
     if (@available(iOS 13.0, *)) {
         UIWindowScene *scene = DLSceneOwningTopWindow();
@@ -466,6 +608,11 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
     if (!win) {
         DLProbe(@"decoy 放弃：无法创建窗口");
         sShared = nil;
+        sPresentFailCount++;
+        if (sPresentFailCount >= 2) {
+            sGaveUp = YES;
+            DLProbe(@"!!! decoy 连续 %ld 次无法创建窗口 → 放弃干预（fail-open）", (long)sPresentFailCount);
+        }
         return;
     }
 
@@ -479,26 +626,68 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
     sWindow = win;   // ⭐ 自己强持有（防止宿主回收，见 sWindow 注释）
     DLProbe(@"decoy 窗口层级=%.0f（呈现前最高的其它窗口=%.0f）", wantLevel, topBefore);
 
-    // 关键：让这个窗口能收到触摸（hidden 的窗口收不到）
+    // ⭐⭐⭐ v0.1.19 铁律 A：**绝不调用 makeKeyAndVisible！**
+    //   窗口要显示、要收触摸，只需要 hidden=NO + 层级够高；
+    //   一旦成为 key window，系统锁屏就失去 key 状态，我们退出后
+    //   锁屏键盘会彻底点不动（用户实测「正常输入密码界面点不动了」）。
     win.hidden = NO;
-    [win makeKeyAndVisible];
 
-    DLProbe(@"decoy 已呈现 windowLevel=%.0f scene=%d",
-            win.windowLevel, (int)(win.windowScene != nil));
+    sPresentFailCount = 0;   // 成功一次就清零
+    sShownAt = CFAbsoluteTimeGetCurrent();   // ⭐ v0.1.19：记录展示起点
+    DLProbe(@"decoy 已呈现 windowLevel=%.0f scene=%d key=%d（不抢 key window）",
+            win.windowLevel, (int)(win.windowScene != nil), (int)win.isKeyWindow);
+    if (win.isKeyWindow && sPrevKeyWindow) {
+        DLProbe(@"[安全] ⚠️ 意外成为 key window → 立刻还给系统");
+        DLRestoreKeyWindow();
+    }
 }
 
+// ⭐ v0.1.19：拆窗口统一走这个内部方法。
+//   userInitiated=YES  —— 用户主动退出（点退出 App / 隐藏手势）
+//                          → 立 sUserDismissed 标记，守护循环不许再复活
+//   userInitiated=NO   —— 我们自己清理残留 / 重建前拆除
+//                          → **绝不碰 sUserDismissed**（旧代码在这里踩了坑：
+//                            它会把刚复位好的状态又置 YES，守护循环立刻收工）
 + (void)dismissDecoy {
-    if (!sShared) return;
-    DLProbe(@"decoy 退出假空间");
-    // ⭐ v0.1.18：先立「用户主动退出」标记 —— 守护循环看到它就会立刻收工，
-    //    否则用户点一次退出会被守护循环在 0.5 秒内复活（表现为反复闪）。
-    sUserDismissed = YES;
-    sKeeperActive = NO;
-    DLProbe(@"[守护] 标记用户退出：后续不再自动复活");
+    [self teardownDecoyUserInitiated:YES];
+}
+
+// ⭐ v0.1.19：纯清理（不标记用户退出）。给「锁屏消失/用户去解锁/系统重建锁屏」用。
++ (void)forceTeardown {
+    [self teardownDecoyUserInitiated:NO];
+}
+
++ (NSTimeInterval)shownDuration {
+    if (!sShared && !sWindow) return -1.0;
+    if (sShownAt <= 0.0) return -1.0;
+    return CFAbsoluteTimeGetCurrent() - sShownAt;
+}
+
++ (void)teardownDecoyUserInitiated:(BOOL)userInitiated {
+    // ⚠️ 不能只判 sShared —— 残留场景下可能 sShared 已空但 sWindow 还在，
+    //    那样就会漏拆一个挡在锁屏前面的窗口（正是「点不动」的成因之一）。
+    if (!sShared && !sWindow) return;
 
     UIWindow *win = sShared.view.window ?: sWindow;   // v0.1.15：兜底取强持有的窗口
+    DLProbe(@"decoy 拆除窗口（%@）win=%@",
+            userInitiated ? @"用户主动退出" : @"内部清理/重建",
+            win ? NSStringFromClass(object_getClass(win)) : @"(无)");
+
+    if (userInitiated) {
+        sUserDismissed = YES;
+        sKeeperActive = NO;
+        DLProbe(@"[守护] 标记用户退出：后续不再自动复活");
+    }
+
     sShared = nil;
     sWindow = nil;
+    sShownAt = 0.0;
+
+    // 铁律 B：拆窗口只有一个出口（hidden + 清 rootViewController + 摘 scene）
+    DLTeardownWindow(win);
+
+    // ⭐ v0.1.19 核心：把 key window 还给系统，否则锁屏键盘点不动
+    DLRestoreKeyWindow();
 
     // ⭐ v0.1.17：退出前把系统锁屏的密码框清干净。
     // 命中伪密码时末尾那位被我们吞掉了，框里可能残留前 N-1 位；
@@ -506,13 +695,6 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
     @try {
         DLPrepareNativeLockScreen();
     } @catch (__unused NSException *e) { }
-
-    // 直接销毁自建窗口（不能只 dismiss 模态 —— 窗口还在就还在屏幕上）
-    if (win) {
-        win.hidden = YES;
-        win.rootViewController = nil;
-        win.windowScene = nil;
-    }
 }
 
 #pragma mark - 生命周期

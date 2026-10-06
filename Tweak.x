@@ -128,6 +128,56 @@ static void DLLogInputCapture(NSString *src);
 static void DLClearField(id field);
 
 // ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.19 安全拆除：只在「假空间已经展示了一会儿」时才动手拆。
+//
+// 为什么需要它（2026-10-06 实测事故）：
+//   用户反馈「正常输入密码界面点不动了」。根因是我们自建的高层级窗口
+//   在锁屏消失 / 用户去解锁时**没有被拆掉**，变成了一个看不见却挡触摸的挡板。
+//   而 `[win makeKeyAndVisible]` 还会把系统锁屏的 key window 抢走，
+//   我们一隐藏窗口，锁屏就彻底接不到触摸。
+//
+// 但也不能无脑拆 —— 我们「吞掉密码最后一位」这个动作本身就会让系统的
+// 锁屏 UI 发生变动，可能顺带触发锁屏生命周期回调。所以加一个时间闸：
+// 只有展示时长超过 `after` 秒（说明不是我们刚铺上去的）才允许拆。
+// ---------------------------------------------------------------------------
+static void DLSafeTeardownIfStale(NSTimeInterval after, const char *why) {
+    if (!DLIsSpringBoard()) return;
+    if (![DLDecoyController isShowing]) return;
+    NSTimeInterval d = [DLDecoyController shownDuration];
+    if (d < 0.0 || d < after) return;
+    DLProbe(@"[安全] %s（假空间已展示 %.1fs > %.0fs）→ 拆除窗口，把锁屏还给系统",
+            why, d, after);
+    [DLDecoyController forceTeardown];
+}
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.19 键盘保护阀（fail-open 的最后一道闸）
+//
+// 事故背景：v0.1.17 引入「命中伪密码就吞掉这一位按键」，本意是让系统收不满密码
+// 从而不判错。但这套机制一旦被误触发（例如用户把伪密码设成了真实密码、
+// 或判定逻辑出现异常），**用户就再也无法用密码解锁** —— 这是不可接受的。
+//
+// 所以加一个硬闸：不管什么原因，只要「吞键」在短时间内过于频繁，
+// 就立刻停止吞键、把控制权完全交还系统。功能可以失效，设备不能锁死。
+// ---------------------------------------------------------------------------
+static BOOL DLSafeToSuppress(void) {
+    static CFAbsoluteTime windowStart = 0.0;
+    static int count = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - windowStart > 10.0) {
+        windowStart = now;
+        count = 0;
+    }
+    count++;
+    if (count > 3) {
+        DLProbe(@"!!! [保护阀] 10 秒内已吞键 %d 次 → 停止吞键（fail-open，键盘保证可用）",
+                count);
+        return NO;
+    }
+    return YES;
+}
+
+// ---------------------------------------------------------------------------
 // ⭐⭐ v0.1.14 核心：输入长度够了就**主动**判定，不再等系统回调
 //
 // 这是本版与 v0.1.13 的唯一本质区别：
@@ -170,10 +220,17 @@ static void DLTriggerActiveVerdict(NSString *src) {
     DLPasscodeVerdict v = [DLDecoyController handleCapturedPasscode:digits];
 
     if (v == DLPasscodeVerdictDecoy) {
-        // ⭐ v0.1.17：吞掉这次系统调用 —— 系统永远收不满 6 位，就不会判错
-        gDLSuppressOrig = YES;
-        gDLSuppressAt = CFAbsoluteTimeGetCurrent();
-        DLProbe(@"[主动判定] ✅ 命中伪密码 → 已挂起「抑制系统提交」（无密码错误/无刷脸/无锁定）");
+        // ⭐ v0.1.19：吞键之前先过「键盘保护阀」。
+        //    理由：吞键是**唯一**能让用户键盘失效的机制（万一伪密码被设成了真实密码，
+        //    或者判定逻辑被写成每键都命中，就会把用户彻底锁在外面）。
+        //    10 秒内超过 3 次就判定异常，立刻停止吞键 —— 宁可功能失效，绝不锁死键盘。
+        if (!DLSafeToSuppress()) {
+            DLProbe(@"!!! [主动判定] 吞键次数异常 → 本次不吞，交给系统（fail-open）");
+        } else {
+            gDLSuppressOrig = YES;
+            gDLSuppressAt = CFAbsoluteTimeGetCurrent();
+            DLProbe(@"[主动判定] ✅ 命中伪密码 → 已挂起「抑制系统提交」（无密码错误/无刷脸/无锁定）");
+        }
         DLResetInput();       // 清掉，避免残留影响下一次
     } else {
         DLProbe(@"[主动判定] ➡️ 非伪密码 → 不干预，交给系统原生流程");
@@ -1210,7 +1267,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.18 退出修复版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.19 安全加固版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1351,11 +1408,20 @@ static void DLLogInputCapture(NSString *src) {
 - (void)lockUIFromSource:(int)source withOptions:(id)options {
     DLResetInput();
     DLProbe(@"锁屏出现 → 清空输入缓冲");
+    // ⭐ v0.1.19：锁屏重建时，若我们的窗口已经挂了很久（>8 秒），
+    //    说明它不是刚铺上去的，而是以「残留挡板」的形式留在界面上 →
+    //    必须拆掉，否则用户看得见锁屏却点不动。
+    DLSafeTeardownIfStale(8.0, "锁屏重建");
     %orig;
 }
 - (void)noteLockScreenUIDidDisappear {
     // 进真桌面时清掉一切痕迹（避免下次锁屏被上次输入污染）
     DLResetInput();
+    // ⭐ v0.1.19：锁屏消失 = 用户大概率去解锁了（真实密码 / Face ID）。
+    //    此时**必须**把我们自建的窗口拆掉 —— 否则它会以一个
+    //    「看不见却挡触摸」的高层级窗口留在界面上，用户就会出现
+    //    「正常输入密码界面点不动」的现象（2026-10-06 实测事故）。
+    DLSafeTeardownIfStale(3.0, "锁屏消失（用户去解锁）");
     %orig;
 }
 
@@ -1396,6 +1462,9 @@ static void DLLogInputCapture(NSString *src) {
 // 解锁**成功**回调 —— 出现它说明系统认可了这次解锁
 - (void)coverSheetViewControllerHandleUnlockAttemptSucceeded:(id)vc {
     DLProbe(@"[解锁请求] ★★ HandleUnlockAttemptSucceeded 被调用（系统认可解锁）");
+    // ⭐ v0.1.19：系统真的认可了解锁 = 用户已经/即将进真桌面 →
+    //    我们的窗口一律拆掉（哪怕只展示了 1 秒）。这是最强的清理信号。
+    DLSafeTeardownIfStale(0.5, "系统认可解锁");
     %orig;
 }
 
