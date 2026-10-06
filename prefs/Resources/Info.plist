@@ -5,8 +5,8 @@
     CFBundleInfoDictionaryVersion = "6.0";
     CFBundleName = "DecoyLockPrefs";
     CFBundlePackageType = "BNDL";
-    CFBundleShortVersionString = "0.1.16";
-    CFBundleVersion = "0.1.16";
+    CFBundleShortVersionString = "0.1.17";
+    CFBundleVersion = "0.1.17";
     CFBundleDisplayName = "伪锁屏设置";
     NSPrincipalClass = "DLRootListController";
 }

@@ -72,6 +72,32 @@ static NSMutableString *gDLInput = nil;
 static CFAbsoluteTime   gDLInputStamp = 0.0;
 static NSString        *gDLLastSrc = @"";
 
+// ⭐⭐ v0.1.17：抑制系统提交（本版核心）
+//
+// 用户反馈：「输入假密码后还是显示密码错误，然后还要刷脸才能进入假空间」
+//   → 说明两件事同时成立：
+//     ① 系统**真的收到了**这 6 位伪密码，所以走了「验证失败」流程
+//        （显示密码错误 + 触发刷脸重试 + 累计错误次数锁定）
+//     ② 我们的假空间窗口其实在锁屏 UI **底下**，所以「密码错误/刷脸」看得见，
+//        必须等刷脸把锁屏顶掉，假空间才露出来
+//
+//  修法（配合 DLDecoyController 的窗口层级修正）：
+//    判定命中伪密码的那一刻，**把这一位按键吞掉，不交给系统** ——
+//    系统的密码框永远收不满 6 位，就不会触发校验，
+//    自然没有「密码错误」、没有刷脸、也没有锁定惩罚。
+//    随后我们自己的假空间（此时已在最上层）立刻盖上来 → 体感是「秒进」。
+//
+//  ⚠️ 只吞「伪密码」这一次；真实密码一位都不会少（假密码 ≠ 真密码 → 不吞）。
+static BOOL          gDLSuppressOrig = NO;    // 是否吞掉下一次系统调用
+static CFAbsoluteTime gDLSuppressAt  = 0.0;   // 设置时间（防止迟到消费）
+
+// 安全清空密码框：
+//   ⚠️ 绝不用 [field clear] / %orig(@"") —— 这两个都依赖「原实现存在」，
+//      如果该类没实现（或 Logos 给不存在的类补了方法），%orig 就是跳 NULL → 崩。
+//      做法：用 MSHookMessageEx 手动挂 clear 并**保存原 IMP**，只有拿非 NULL
+//      才调用；否则退回到「清内部真正的 UITextField」（UIKit 公开 API，零风险）。
+static IMP gDLOrigClear = NULL;
+
 static NSMutableString *DLInputBuffer(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -97,6 +123,9 @@ static void DLResetInput(void) {
 
 // v0.1.10：输入捕获自检（定义在后面，先声明）
 static void DLLogInputCapture(NSString *src);
+
+// v0.1.17：清空密码框（定义在后面 Hook 组 A 之前，先声明 —— 视图树遍历要用）
+static void DLClearField(id field);
 
 // ---------------------------------------------------------------------------
 // ⭐⭐ v0.1.14 核心：输入长度够了就**主动**判定，不再等系统回调
@@ -141,13 +170,28 @@ static void DLTriggerActiveVerdict(NSString *src) {
     DLPasscodeVerdict v = [DLDecoyController handleCapturedPasscode:digits];
 
     if (v == DLPasscodeVerdictDecoy) {
-        DLProbe(@"[主动判定] ✅ 命中伪密码 → 假空间已排出呈现队列");
+        // ⭐ v0.1.17：吞掉这次系统调用 —— 系统永远收不满 6 位，就不会判错
+        gDLSuppressOrig = YES;
+        gDLSuppressAt = CFAbsoluteTimeGetCurrent();
+        DLProbe(@"[主动判定] ✅ 命中伪密码 → 已挂起「抑制系统提交」（无密码错误/无刷脸/无锁定）");
         DLResetInput();       // 清掉，避免残留影响下一次
     } else {
         DLProbe(@"[主动判定] ➡️ 非伪密码 → 不干预，交给系统原生流程");
         // ⚠️ 不清空：不清空的话用户继续输入时 lastJudged 逻辑仍能防重；
         //    清空的话会丢掉「用户真实密码」的痕迹，没必要。
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.1.17：判断「抑制」是否仍然有效（防止跨调用误吞）
+// 命中判定与消费抑制的调用栈是紧挨着的（同一个 hook 内），
+// 这里只做 2 秒保险，避免任何异常路径把 flag 留到下一次输入。
+// ---------------------------------------------------------------------------
+static BOOL DLConsumeSuppress(void) {
+    if (!gDLSuppressOrig) return NO;
+    BOOL ok = (CFAbsoluteTimeGetCurrent() - gDLSuppressAt) < 2.0;
+    gDLSuppressOrig = NO;       // 无论如何都消费掉
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +293,66 @@ static NSString *DLSniffPasscodeFromWindows(void) {
 }
 
 // ---------------------------------------------------------------------------
+// ⭐ v0.1.17：在视图树里找「密码输入框对象」本身（不是它的文本）
+//   退出假空间前要用它把锁屏密码框清干净，否则用户回到锁屏会看到半截密码，
+//   再敲一位就凑成一个错误密码 → 又触发系统错误惩罚（很坑）。
+// ---------------------------------------------------------------------------
+static UIView *DLFindPasscodeFieldIn(UIView *v, int depth) {
+    if (!v || depth > 24) return nil;
+
+    NSString *cls = NSStringFromClass([v class]);
+    BOOL isEntry = [cls containsString:@"PasscodeEntryField"] ||
+                   [cls containsString:@"FixedDigitPasscodeEntry"];
+    BOOL isSetup = [cls containsString:@"ChangePasscode"] ||
+                   [cls containsString:@"PasscodeSet"] ||
+                   [cls containsString:@"PasscodeCreation"];
+    if (isEntry && !isSetup) return v;
+
+    for (UIView *sub in v.subviews) {
+        UIView *r = DLFindPasscodeFieldIn(sub, depth + 1);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static UIView *DLFindPasscodeField(void) {
+    if (!DLIsSpringBoard()) return nil;
+
+    NSMutableArray *wins = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]]) {
+                [wins addObjectsFromArray:((UIWindowScene *)sc).windows];
+            }
+        }
+    }
+    if (!wins.count) [wins addObjectsFromArray:UIApplication.sharedApplication.windows];
+
+    for (UIWindow *w in wins) {
+        UIView *f = DLFindPasscodeFieldIn(w, 0);
+        if (f) return f;
+    }
+    return nil;
+}
+
+// ⭐ v0.1.17：退出假空间前调用 —— 把系统锁屏的密码框清干净
+//（导出给 DLDecoyController 用，见 DLCommon.h 声明）
+void DLPrepareNativeLockScreen(void) {
+    if (!DLIsSpringBoard()) return;
+    @try {
+        UIView *field = DLFindPasscodeField();
+        if (field) {
+            DLProbe(@"[退出清理] 找到密码框 %@ → 清空",
+                    NSStringFromClass(object_getClass(field)));
+            DLClearField(field);
+        } else {
+            DLProbe(@"[退出清理] 未找到密码框（可能锁屏已收起，正常）");
+        }
+        DLResetInput();
+    } @catch (__unused NSException *e) { }
+}
+
+// ---------------------------------------------------------------------------
 // 判定：是否应当劫持这次解锁
 // ---------------------------------------------------------------------------
 static BOOL DLShouldHijackUnlock(NSString *from) {
@@ -318,26 +422,85 @@ static BOOL DLShouldHijackUnlock(NSString *from) {
 static void DLReconOpenWindow(void);
 static void DLEnsureReconForPasscodeField(id field);
 
+// ---------------------------------------------------------------------------
+// ⭐ v0.1.17：安全清空密码框
+//   触发场景：命中伪密码后吞掉按键，此时框里还留着前 N-1 位，
+//   要清干净，否则用户退出假空间后会看到半截密码（再敲一位就会凑成错误密码）。
+//
+//   ⚠️ 为什么不用 [field clear]：该类的 clear 不一定存在，Logos 给不存在的
+//      方法补 hook 后 %orig 就是跳 NULL → 直接崩。改用 MSHookMessageEx 手动挂，
+//      只有拿到非 NULL 的原 IMP 才调用（见 DLSetupClearHook）。
+//   ⚠️ 为什么不用 %orig(@""): 同理依赖原实现存在。
+//   兜底：清内部真正的 UITextField（UIKit 公开 API，零风险）。
+// ---------------------------------------------------------------------------
+static void DLClearField(id field) {
+    if (!field) return;
+
+    if (gDLOrigClear) {
+        @try {
+            ((void (*)(id, SEL))gDLOrigClear)(field, @selector(clear));
+            DLProbe(@"[抑制] 已用原生 clear 清空密码框");
+            return;
+        } @catch (__unused NSException *e) { }
+    }
+
+    // 兜底：清内部 UITextField（最多下探 3 层）
+    if ([field isKindOfClass:[UITextField class]]) {
+        [(UITextField *)field setText:@""];
+        DLProbe(@"[抑制] 已清空内部 UITextField");
+        return;
+    }
+    if ([field isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)field;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:v];
+        int guard = 0;
+        while (stack.count && guard++ < 40) {
+            UIView *cur = stack.firstObject;
+            [stack removeObjectAtIndex:0];
+            if ([cur isKindOfClass:[UITextField class]]) {
+                [(UITextField *)cur setText:@""];
+                DLProbe(@"[抑制] 已清空子视图里的 UITextField");
+                return;
+            }
+            [stack addObjectsFromArray:cur.subviews];
+        }
+    }
+    DLProbe(@"[抑制] 未能清空密码框（无可用途径）");
+}
+
 @interface SBUIPasscodeEntryField : UIView
 @end
 
 %hook SBUIPasscodeEntryField
-- (void)setText:(NSString *)text {
-    %orig;
-    DLSetInput(text, @"entry.set");
-    DLReconOpenWindow();
-}
+// ⚠️ 顺序很重要（v0.1.17 调整）：**先判定、后放行**。
+//    旧版是 %orig 在前，等于系统已经吃下这一位我们才判定 —— 太晚了。
 - (void)appendString:(NSString *)s {
+    DLAppendInput(s, @"entry.append");     // 更新缓冲 + 主动判定（内部会设抑制标志）
+
+    if (DLConsumeSuppress()) {
+        DLProbe(@"[抑制] 吞掉这一位「%@」→ 系统收不满密码，不会触发校验",
+                s ?: @"?");
+        DLClearField(self);                // 清掉前 N-1 位残留
+        return;                            // ⚠️ 不调 %orig：系统拿不到这一位
+    }
+
     %orig;
-    DLAppendInput(s, @"entry.append");
     DLReconOpenWindow();
     // v0.1.10：每次输入都沿「视图/响应者/delegate」链上行侦查（内部幂等）
     DLEnsureReconForPasscodeField(self);
 }
-- (void)clear {
+- (void)setText:(NSString *)text {
+    DLSetInput(text, @"entry.set");        // 先判定（同上，顺序调整）
+    DLReconOpenWindow();
+
+    if (DLConsumeSuppress()) {
+        DLProbe(@"[抑制] 吞掉这次 setText（len=%lu）→ 系统不会看到完整伪密码",
+                (unsigned long)(text ? text.length : 0));
+        DLClearField(self);
+        return;                            // ⚠️ 不调 %orig
+    }
+
     %orig;
-    DLResetInput();
-    DLProbe(@"[输入] 源=entry.clear 已清空");
 }
 - (void)deleteBackward {
     %orig;
@@ -349,6 +512,39 @@ static void DLEnsureReconForPasscodeField(id field);
     }
 }
 %end
+
+// ---------------------------------------------------------------------------
+// v0.1.17：clear 改为**手动挂钩**（不再用 Logos %hook）
+//
+// 旧版 `%hook SBUIPasscodeEntryField - (void)clear` 有隐患：
+// 如果该类根本没实现 clear，Logos 仍会把方法加到类上（%orig 指向 NULL），
+// 一旦有代码调用 / respondsToSelector: 探测到并调用 → 跳 NULL 崩溃。
+// 手动挂钩能**拿到原 IMP 并判空**，这才安全 —— 而且 DLClearField 正好需要它
+// 来安全清空密码框（见上面的说明）。
+// ---------------------------------------------------------------------------
+static void DLHookedClear(id self, SEL _cmd) {
+    if (gDLOrigClear) ((void (*)(id, SEL))gDLOrigClear)(self, _cmd);
+    DLResetInput();
+    DLProbe(@"[输入] 源=entry.clear 已清空");
+}
+
+static void DLSetupClearHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    Class c = NSClassFromString(@"SBUIPasscodeEntryField");
+    if (!c) {
+        DLProbe(@"[挂钩] clear：找不到 SBUIPasscodeEntryField（跳过）");
+        return;
+    }
+    if (!class_getInstanceMethod(c, @selector(clear))) {
+        DLProbe(@"[挂钩] clear：该类未实现 → 不挂钩（避免 %orig 跳 NULL）");
+        return;
+    }
+    MSHookMessageEx(c, @selector(clear), (IMP)&DLHookedClear, &gDLOrigClear);
+    DLProbe(@"[挂钩] ✅ SBUIPasscodeEntryField clear（orig=%p）", (void *)gDLOrigClear);
+}
 
 // ===========================================================================
 // Hook 组 B：键盘删除键（UITextField 是密码框内部真正的编辑视图）
@@ -1013,7 +1209,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.16 点App退出版）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.17 抑制提交+层级探测版）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1265,6 +1461,7 @@ static void DLBootRound(void) {
 
         if (gDLBootRounds == 1) {
             DLHookAllAttemptUnlock();
+            DLSetupClearHook();      // ⭐ v0.1.17：安全清空密码框要用原 IMP
         }
 
         // 侦查挂钩：对嫌疑类挂钩，日志会告诉我们真实的密码验证方法名

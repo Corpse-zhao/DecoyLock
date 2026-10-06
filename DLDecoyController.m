@@ -142,6 +142,15 @@ static DLDecoyController *sShared = nil;
 //   剩下的「被隐藏/被移除」交给下面的守护循环（startKeeper）自愈。
 static UIWindow *sWindow = nil;
 
+// v0.1.17：窗口层级探测（定义在下方 presentIfConfigured 之前）
+// verbose=YES 时把每个窗口的类名+层级打进日志（只在呈现时用，
+// 守护循环每 0.5 秒调一次，不能每次都刷屏）
+static CGFloat DLMaxOtherWindowLevelVerbose(BOOL verbose);
+
+static CGFloat DLMaxOtherWindowLevel(void) {
+    return DLMaxOtherWindowLevelVerbose(NO);
+}
+
 // ---------------------------------------------------------------------------
 // ⭐⭐ v0.1.14 主动取词 —— 核心决策
 //
@@ -243,6 +252,17 @@ static BOOL sKeeperActive = NO;
         DLProbe(@"[守护] 第 %ld 次检查：假空间不可见（%@）→ 立即复活",
                 (long)n, state);
         [self reviveOrPresent];
+    } else if (sWindow) {
+        // ⭐ v0.1.17：可见时也顺便检查层级 —— 系统可能在我们之后又拉了一个
+        //    更高的窗口（例如锁屏重建），把我们压到下面去（用户就会看到
+        //    「密码错误/刷脸」而不是假空间）。发现被压就立刻抬上去。
+        CGFloat want = DLMaxOtherWindowLevel() + 1000.0;
+        if (want < 100000.0) want = 100000.0;
+        if (sWindow.windowLevel < want) {
+            DLProbe(@"[守护] 第 %ld 次：被更高窗口压住（当前 %.0f < 需要 %.0f）→ 抬升层级",
+                    (long)n, sWindow.windowLevel, want);
+            sWindow.windowLevel = want;
+        }
     }
     if (n + 1 < 30) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -290,6 +310,77 @@ static BOOL sKeeperActive = NO;
     return sShared != nil && sShared.view.window != nil && !sShared.view.window.hidden;
 }
 
+#pragma mark - ⭐⭐ v0.1.17 窗口层级探测（「必须刷脸才看到假空间」的根因修复）
+
+// 用户反馈：「输入假密码后还是显示密码错误，然后还要刷脸才能进入假空间」
+//   → 铁证：我们的窗口**一直在锁屏 UI 底下**。
+//     否则不可能同时看到「密码错误」和刷脸提示（它们都该被我们的窗口盖住）。
+//     刷脸把锁屏顶掉之后，我们的窗口才露出来 —— 这正是用户描述的现象。
+//
+// 结论：**windowLevel 硬编码 100000 不够**。SpringBoard 自己给锁屏/网络锁等
+//       窗口用的层级是它自己的常量（可能远大于 100000），必须**运行时探测**，
+//       永远待在当时最高的那个窗口之上。
+//
+// 本函数同时把所有现存窗口的类名+层级打进日志 —— 这是下一轮排查最重要的情报。
+
+// 返回「除我们自己的窗口以外」所有窗口的最大层级
+static CGFloat DLMaxOtherWindowLevelVerbose(BOOL verbose) {
+    CGFloat maxLv = 0.0;
+    NSMutableArray<UIWindow *> *all = [NSMutableArray array];
+
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            [all addObjectsFromArray:ws.windows];
+        }
+    }
+    // ⚠️ 再补一份 application.windows：某些系统窗口（如锁屏）不一定出现在
+    //    scene.windows 里，但一定在 application.windows 里。
+    if (UIApplication.sharedApplication.windows.count) {
+        [all addObjectsFromArray:UIApplication.sharedApplication.windows];
+    }
+
+    NSMutableArray *seen = [NSMutableArray array];
+    for (UIWindow *w in all) {
+        if (!w || w == sWindow) continue;
+        NSString *cls = NSStringFromClass(object_getClass(w));
+        NSString *key = [NSString stringWithFormat:@"%@|%.0f", cls, w.windowLevel];
+        if ([seen containsObject:key]) continue;      // 去重，日志别刷屏
+        [seen addObject:key];
+
+        if (verbose) {
+            DLProbe(@"[窗口清点] %@ level=%.0f hidden=%d key=%d",
+                    cls, w.windowLevel, (int)w.hidden, (int)[w isKeyWindow]);
+        }
+
+        if (w.windowLevel > maxLv) maxLv = w.windowLevel;
+    }
+    return maxLv;
+}
+
+// 找出「层级最高的那个窗口」所在的 scene —— 我们的窗口挂到同一个 scene，
+// 才能保证在同一个合成上下文里排序（不同 scene 之间比层级没意义）。
+static UIWindowScene *DLSceneOwningTopWindow(void) {
+    UIWindowScene *best = nil;
+    CGFloat bestLv = -1.0;
+
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            for (UIWindow *w in ws.windows) {
+                if (w.windowLevel > bestLv) { bestLv = w.windowLevel; best = ws; }
+            }
+        }
+    }
+    if (!best) {
+        // 没有 scene 信息（或 iOS 12）→ 交给调用方走 initWithFrame 分支
+        best = nil;
+    }
+    return best;
+}
+
 + (void)presentIfConfigured {
     if (!DLEnabled()) {
         DLProbe(@"decoy 跳过：插件未启用");
@@ -314,30 +405,35 @@ static BOOL sKeeperActive = NO;
     sShared = vc;
 
     // ⚠️ 关键：不能用「锁屏那个 key window」来 present。
-    //    锁屏的窗口会随解锁流程被系统拆掉，模态一挂上去就跟着消失；
-    //    而且锁屏状态下 isKeyWindow 常常取不到合适的窗口。
-    //    正解 = 自建一个独立 UIWindow，windowLevel 拉到 UIWindowLevelAlert 之上
-    //    （SpringBoard 自己就用这个手法盖系统 UI），窗口生命周期由我们掌控。
+    //    锁屏的窗口会随解锁流程被系统拆掉，模态一挂上去就跟着消失。
+    //    正解 = 自建独立 UIWindow；但**必须挂在「层级最高的窗口所在的那个 scene」**，
+    //    并且层级要高过当时所有窗口（v0.1.17 修正，见上面两段说明）。
     UIWindow *win = nil;
+    CGFloat topBefore = DLMaxOtherWindowLevelVerbose(YES);   // 顺便把所有窗口打进日志
 
     if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = nil;
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)sc;
-            // 优先要前台活跃的那个 scene
-            if (ws.activationState == UISceneActivationStateForegroundActive) {
-                scene = ws;
-                break;
+        UIWindowScene *scene = DLSceneOwningTopWindow();
+        if (!scene) {
+            // 兜底：前台活跃的 scene
+            for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+                UIWindowScene *ws = (UIWindowScene *)sc;
+                if (ws.activationState == UISceneActivationStateForegroundActive) {
+                    scene = ws;
+                    break;
+                }
+                if (!scene) scene = ws;
             }
-            if (!scene) scene = ws;
         }
         if (scene) {
             win = [[UIWindow alloc] initWithWindowScene:scene];
+            DLProbe(@"decoy 使用 scene（顶层窗口所属）activation=%ld",
+                    (long)scene.activationState);
         }
     }
     if (!win) {
         win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        DLProbe(@"decoy 使用 initWithFrame（无可用 scene）");
     }
     if (!win) {
         DLProbe(@"decoy 放弃：无法创建窗口");
@@ -345,14 +441,15 @@ static BOOL sKeeperActive = NO;
         return;
     }
 
-    // 盖在锁屏 / 通知中心 / 控制中心 之上。
-    // ⭐ v0.1.15：2100 不保险 —— SpringBoard 自己的锁屏（CoverSheet）窗口
-    //    用的自定义层级，实测我们的窗口在 2100 层可能被压在下面或被重置。
-    //    直接拉到 100000（远高于系统所有常规层级；本窗口无键盘、无系统
-    //    交互，高层级无副作用）。
-    win.windowLevel = 100000.0;
+    // ⭐ v0.1.17：层级 = max(硬编码下限, 现存最高 + 1000)
+    //   —— 硬编码 100000 曾被 SpringBoard 的锁屏窗口压在下面（用户实测
+    //      必须刷脸解锁后才看到假空间）。探测式取值永远压在最上面。
+    CGFloat wantLevel = topBefore + 1000.0;
+    if (wantLevel < 100000.0) wantLevel = 100000.0;
+    win.windowLevel = wantLevel;
     win.rootViewController = vc;
     sWindow = win;   // ⭐ 自己强持有（防止宿主回收，见 sWindow 注释）
+    DLProbe(@"decoy 窗口层级=%.0f（呈现前最高的其它窗口=%.0f）", wantLevel, topBefore);
 
     // 关键：让这个窗口能收到触摸（hidden 的窗口收不到）
     win.hidden = NO;
@@ -368,6 +465,13 @@ static BOOL sKeeperActive = NO;
     UIWindow *win = sShared.view.window ?: sWindow;   // v0.1.15：兜底取强持有的窗口
     sShared = nil;
     sWindow = nil;
+
+    // ⭐ v0.1.17：退出前把系统锁屏的密码框清干净。
+    // 命中伪密码时末尾那位被我们吞掉了，框里可能残留前 N-1 位；
+    // 不清掉的话用户回到锁屏再敲一位就凑成「错误密码」→ 又触发系统错误惩罚。
+    @try {
+        DLPrepareNativeLockScreen();
+    } @catch (__unused NSException *e) { }
 
     // 直接销毁自建窗口（不能只 dismiss 模态 —— 窗口还在就还在屏幕上）
     if (win) {

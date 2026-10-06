@@ -5,7 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <unistd.h>
 
-#define DL_VERSION      @"0.1.16"
+#define DL_VERSION      @"0.1.17"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 
 // 共享配置目录（SpringBoard 进程与「设置」进程都能写的位置）
@@ -36,5 +36,11 @@ FOUNDATION_EXPORT void DLProbeClear(void);
 
 // 调用「设置」进程刷新面板（跨进程通知）
 FOUNDATION_EXPORT void DLPostPrefsChanged(void);
+
+// ⭐ v0.1.17：退出假空间前调用 —— 把系统锁屏的密码框清干净。
+// 背景：命中伪密码时我们吞掉了最后一位（系统收不满 → 不判错，无密码错误/无刷脸），
+// 但密码框里可能残留前 N-1 位。若不清掉，用户回到锁屏后再敲一位就会凑成
+// 一个「错误密码」→ 触发系统错误惩罚。实现见 Tweak.x。
+FOUNDATION_EXPORT void DLPrepareNativeLockScreen(void);
 
 #endif /* DLCommon_h */
