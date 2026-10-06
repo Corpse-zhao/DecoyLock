@@ -208,3 +208,60 @@ NSString *DLProbeRead(void) {
 void DLProbeClear(void) {
     [[NSFileManager defaultManager] removeItemAtPath:DLProbePath() error:NULL];
 }
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.22：暂停 / 恢复 Face ID 匹配
+//
+// 用户实测：输伪密码后假空间铺上去了，系统也没判错，但真机仍被 Face ID 解开
+// （用户感知 = 「还是要刷脸」；退出假空间后直接落在真桌面）。
+//
+// 做法：SpringBoard 里有个 SBUIBiometricResource（生物识别资源），
+// 关掉它的 matchingEnabled 即可让锁屏不再自动尝试 Face ID。
+//
+// ⚠️ 安全约束（必须严格遵守）：
+//    1. 全程 respondsToSelector 保护 —— 不同 iOS 版本类名/方法可能不同，
+//       拿不到就**静默跳过**，只写一行日志，绝不崩、绝不强改。
+//    2. 只在假空间存在期间关闭；一旦拆除**必须恢复**（两条拆除路径都会调）。
+//    3. ⭐ 幂等：状态没变就不重复调系统 API ——
+//       否则重建窗口时会「恢复→暂停」抖动一次，那一瞬间 Face ID 真的会去匹配。
+// ---------------------------------------------------------------------------
+
+// 我们当前是否处于「已暂停生物识别匹配」的状态（供兜底守护查询）
+static BOOL sBioMatchingOff = NO;
+
+BOOL DLBiometricMatchingIsOff(void) { return sBioMatchingOff; }
+
+void DLSetBiometricMatching(BOOL enabled) {
+    // ⭐ 幂等短路：状态没变直接返回（不重复调系统 API，避免匹配抖动）
+    if (enabled && !sBioMatchingOff) return;
+    if (!enabled && sBioMatchingOff) return;
+
+    Class cls = objc_getClass("SBUIBiometricResource");
+    if (!cls) {
+        DLProbe(@"[FaceID] 找不到 SBUIBiometricResource → 跳过（不干预）");
+        return;
+    }
+
+    id shared = nil;
+    if ([cls respondsToSelector:@selector(sharedInstance)]) {
+        shared = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstance));
+    }
+    if (!shared) {
+        DLProbe(@"[FaceID] 拿不到 SBUIBiometricResource 实例 → 跳过（不干预）");
+        return;
+    }
+
+    // ⚠️ 必须用 respondsToSelector 显式探一次再调 —— 不存在的类/方法直接
+    //    objc_msgSend 到 SBUIBiometricResource 上是**崩溃级**风险。
+    if (![shared respondsToSelector:@selector(setMatchingEnabled:)]) {
+        DLProbe(@"[FaceID] 实例不支持 setMatchingEnabled: → 跳过（不干预）");
+        return;
+    }
+
+    SEL sel = @selector(setMatchingEnabled:);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(shared, sel, enabled);
+    sBioMatchingOff = !enabled;   // ⚠️ 只有真正调用成功后才改状态
+    DLProbe(@"[FaceID] 已%@生物识别匹配（%@）",
+            enabled ? @"恢复" : @"暂停",
+            enabled ? @"退出假空间" : @"假空间展示期间");
+}

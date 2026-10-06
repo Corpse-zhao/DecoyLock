@@ -218,6 +218,12 @@ static NSInteger sPresentFailCount = 0;    // 连续呈现失败次数
 static BOOL      sGaveUp = NO;             // 连续失败 → 彻底放弃干预（fail-open）
 static CFAbsoluteTime sShownAt = 0.0;      // ⭐ v0.1.19：本次呈现的时刻（算展示时长用）
 
+// ⭐⭐ v0.1.22 前向声明：Face ID 暂停/恢复（实现在下方 presentIfConfigured 之前）。
+//    必须先声明后用 —— keeperTick（本小节下面）就要用到 DLResumeBiometric，
+//    而它的定义在文件更后面。文件作用域函数同样遵守「先声明后用」。
+static void DLPauseBiometric(void);
+static void DLResumeBiometric(void);
+
 // 前向声明（定义在窗口工具函数区，这里先用）
 static void DLTeardownWindow(UIWindow *win);
 static void DLRestoreKeyWindow(void);
@@ -331,6 +337,8 @@ static NSArray<UIWindow *> *DLAllWindows(void);
             // 立刻放手，绝不继续折腾用户的锁屏（fail-open）。
             sGaveUp = YES;
             sKeeperActive = NO;
+            // ⭐⭐ v0.1.22：放弃干预 = 终止路径 → 必须恢复 Face ID 匹配。
+            DLResumeBiometric();
             DLProbe(@"!!! [守护] 连续 %ld 次无法呈现 → 本轮放弃干预（fail-open）。"
                     @"若你看到这行，说明插件在这台设备上无法工作，但锁屏不受影响。",
                     (long)sPresentFailCount);
@@ -534,6 +542,73 @@ static void DLRestoreKeyWindow(void) {
     } @catch (__unused NSException *e) { }
 }
 
+// ---------------------------------------------------------------------------
+// ⭐⭐ v0.1.22 Face ID 暂停 / 恢复（含兜底安全网）
+// ---------------------------------------------------------------------------
+// 背景（2026-10-06 用户日志实锤）：输伪密码后假空间确实铺上去了，
+// 系统也没判密码错误（无 resetForFailedPasscode），但真机最后被解开了
+// —— 是系统自己通过 Face ID 放行的。所以「假空间存在期间」必须暂停
+// 生物识别匹配，退出时恢复。
+//
+// ⚠️⚠️ 安全约束：绝不能出现「暂停了却没人恢复」——
+//   那会让用户的 Face ID 被无限期关死（严重事故）。
+//   所以这里做三重保障：
+//     ① 所有终止路径（用户退出 / 锁屏生命周期结束）都显式恢复；
+//     ② 兜底守护：每 5 秒检查一次，发现「假空间已不在展示但仍在暂停」
+//        就立刻恢复（覆盖任何漏掉 teardown 的异常路径）；
+//     ③ 硬上限：连续展示超过 180 秒无条件恢复（最后的保险丝）。
+// ---------------------------------------------------------------------------
+static NSInteger       sBioGuardGen  = 0;     // 代次：新的暂停/恢复会让旧的守护自行作废
+static CFAbsoluteTime  sBioOffSince  = 0.0;   // 进入「暂停」的时刻
+
+static void DLBioGuardTick(NSInteger gen);
+
+// 暂停生物识别匹配 + 启动兜底守护（一次会话只调一次）
+static void DLPauseBiometric(void) {
+    DLSetBiometricMatching(NO);
+    sBioOffSince = CFAbsoluteTimeGetCurrent();
+    sBioGuardGen++;
+    NSInteger myGen = sBioGuardGen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ DLBioGuardTick(myGen); });
+}
+
+// 恢复生物识别匹配（幂等；同时让兜底守护作废）
+static void DLResumeBiometric(void) {
+    sBioGuardGen++;          // 旧守护立即作废
+    sBioOffSince = 0.0;
+    DLSetBiometricMatching(YES);
+}
+
+// ⚠️ 守护的判定基准是「假空间还在不在展示」，**不是**「匹配是不是还关着」。
+//    因为系统可能在我们之后自己又把匹配打开（锁屏重建时常见），
+//    若以「匹配已关」为继续条件，守护会提前收工，漏掉这次重新打开。
+static void DLBioGuardTick(NSInteger gen) {
+    if (gen != sBioGuardGen) return;            // 已被新的暂停/恢复取代
+
+    // ① 假空间已经不在展示 → 收工并恢复（兜底，覆盖任何漏掉 teardown 的异常路径）
+    if (![DLDecoyController isShowing]) {
+        if (DLBiometricMatchingIsOff()) {
+            DLProbe(@"[FaceID][兜底] 假空间已不在展示，但生物识别仍处于暂停 → 立即恢复");
+        }
+        DLResumeBiometric();
+        return;
+    }
+
+    // ② 还在展示 → 重新压制一次（幂等：状态没变就不会真调系统 API、也不会刷日志）。
+    //    这一步专门对付「系统自己把匹配又打开了」。
+    DLSetBiometricMatching(NO);
+
+    // ③ 硬上限：连续展示超 180 秒 → 无条件恢复（最后的保险丝）
+    if (sBioOffSince > 0.0 && CFAbsoluteTimeGetCurrent() - sBioOffSince > 180.0) {
+        DLProbe(@"[FaceID][兜底] 假空间已连续展示超过 180 秒 → 无条件恢复生物识别（安全阀）");
+        DLResumeBiometric();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ DLBioGuardTick(gen); });
+}
+
 + (void)presentIfConfigured {
     // ⭐ v0.1.19 铁律 C：连续呈现失败 → 彻底放弃干预（fail-open）。
     //    宁可功能不生效，也绝不能把用户的锁屏搞坏。
@@ -640,6 +715,13 @@ static void DLRestoreKeyWindow(void) {
         DLProbe(@"[安全] ⚠️ 意外成为 key window → 立刻还给系统");
         DLRestoreKeyWindow();
     }
+
+    // ⭐⭐ v0.1.22：假空间铺上之后，立刻暂停 Face ID 匹配。
+    //   用户日志实锤：系统**没有**判密码错误（无 resetForFailedPasscode），
+    //   假空间也确实呈现了（windowLevel=10001011），但真机最后被解开了
+    //   （退出后 [退出清理] 未找到密码框）—— 那次解锁是 Face ID 干的。
+    //   走 DLPauseBiometric：暂停的同时挂上兜底守护（见上方说明）。
+    DLPauseBiometric();
 }
 
 // ⭐ v0.1.19：拆窗口统一走这个内部方法。
@@ -650,11 +732,20 @@ static void DLRestoreKeyWindow(void) {
 //                            它会把刚复位好的状态又置 YES，守护循环立刻收工）
 + (void)dismissDecoy {
     [self teardownDecoyUserInitiated:YES];
+    // ⭐⭐ v0.1.22：用户主动退出 → 立即恢复 Face ID 匹配。
+    //   ⚠️⚠️ 安全关键：这个「恢复」绝不能漏，否则用户 Face ID 被永久关死。
+    //   放在 teardownDecoyUserInitiated 之外（而不是里面）是刻意的 ——
+    //   那个方法在「重建前清理残留」时也会被调用，若在里面恢复，
+    //   重建瞬间会「恢复→暂停」抖动一次，那一瞬间 Face ID 真的会去匹配人脸。
+    DLResumeBiometric();
 }
 
 // ⭐ v0.1.19：纯清理（不标记用户退出）。给「锁屏消失/用户去解锁/系统重建锁屏」用。
 + (void)forceTeardown {
     [self teardownDecoyUserInitiated:NO];
+    // ⭐⭐ v0.1.22：锁屏生命周期结束 = 明确的终止路径 → 必须恢复 Face ID 匹配。
+    //   ⚠️⚠️ 漏掉这一句 = 用户从锁屏离开后 Face ID 一直是关的（严重事故）。
+    DLResumeBiometric();
 }
 
 + (NSTimeInterval)shownDuration {
@@ -688,6 +779,13 @@ static void DLRestoreKeyWindow(void) {
 
     // ⭐ v0.1.19 核心：把 key window 还给系统，否则锁屏键盘点不动
     DLRestoreKeyWindow();
+
+    // ⭐⭐ v0.1.22：**这里刻意不恢复 Face ID 匹配**。
+    //   本方法同时服务于「重建前清理残留」（例如守护循环复活、层级被压后重建），
+    //   在这些路径上恢复匹配会立刻又被暂停 → 中间那一瞬 Face ID 真会去匹配人脸，
+    //   反而把 bug 重新引回来。
+    //   真正的「终止路径」恢复点只有两处：dismissDecoy / forceTeardown；
+    //   万一两条路都没走到，还有 DLBioGuardTick 每 5 秒兜底 + 180 秒硬上限。
 
     // ⭐ v0.1.17：退出前把系统锁屏的密码框清干净。
     // 命中伪密码时末尾那位被我们吞掉了，框里可能残留前 N-1 位；

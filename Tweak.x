@@ -1267,7 +1267,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.21 提交点拦截 + 退出入口修复）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.22 假空间期间暂停 Face ID）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);

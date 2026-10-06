@@ -328,6 +328,65 @@ jobs:
           print("✅ 提交点已真正拦截伪密码（不刷脸的关键）")
           PY
 
+          echo "--- 检查 17：⭐⭐ Face ID 暂停必须有配套恢复（漏掉＝把用户 Face ID 永久关死） ---"
+          # 2026-10-06 用户日志实锤：输伪密码后假空间铺上去了、系统也没判错，
+          #   但真机最后仍被解开（退出后 [退出清理] 未找到密码框）—— 是 Face ID 干的。
+          #   → v0.1.22 在「假空间展示期间」暂停 SBUIBiometricResource 的匹配。
+          #   ⚠️ 这里最大的风险不是「关不掉」，而是「关了没人恢复」：
+          #      用户 Face ID 会一直失效到下次重启桌面，属严重事故。
+          #   所以本检查强制三件事同时存在：
+          #     (a) 暂停调用确实存在；
+          #     (b) 至少 2 个恢复点（用户主动退出 / 锁屏生命周期结束）+ 兜底守护；
+          #     (c) 实现层必须 respondsToSelector 保护（不同 iOS 版本类名/方法可能不同）。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          common_m = io.open('DLCommon.m', encoding='utf-8', errors='replace').read()
+          common_h = io.open('DLCommon.h', encoding='utf-8', errors='replace').read()
+          ctl = io.open('DLDecoyController.m', encoding='utf-8', errors='replace').read()
+          ctl_nc = re.sub(r'//[^\n]*', '', ctl)
+
+          # (c) 实现层的安全保护
+          if 'SBUIBiometricResource' not in common_m:
+              print("❌ DLCommon.m 里找不到 SBUIBiometricResource（Face ID 暂停未实现）")
+              sys.exit(1)
+          if 'respondsToSelector:@selector(setMatchingEnabled:)' not in common_m:
+              print("❌ DLCommon.m 未对 setMatchingEnabled: 做 respondsToSelector 保护")
+              print("   → 不同 iOS 版本可能没有这个方法，直接调会崩进程")
+              sys.exit(1)
+          if 'DL_VERSION' not in common_h or 'DLBiometricMatchingIsOff' not in common_h:
+              print("❌ DLCommon.h 缺少 DLBiometricMatchingIsOff 声明（兜底守护要用）")
+              sys.exit(1)
+
+          # (a) 暂停确实接在「呈现成功」之后
+          if 'DLPauseBiometric()' not in ctl_nc:
+              print("❌ DLDecoyController.m 里没有调用 DLPauseBiometric()（暂停没接线）")
+              sys.exit(1)
+          if not re.search(r'decoy 已呈现.*?DLPauseBiometric\(\)', ctl_nc, re.S):
+              print("❌ DLPauseBiometric() 不在「decoy 已呈现」之后 → 暂停时机不对")
+              sys.exit(1)
+
+          # (b) 恢复点必须够：dismissDecoy / forceTeardown / 守护 fail-open / 兜底守护
+          resume_sites = len(re.findall(r'DLResumeBiometric\(\)', ctl_nc))
+          if resume_sites < 4:
+              print("❌ DLResumeBiometric() 只出现 %d 处，至少要 4 处" % resume_sites)
+              print("   需要：dismissDecoy（用户退出）/ forceTeardown（锁屏收场）/")
+              print("         守护循环 fail-open / 兜底守护自身")
+              sys.exit(1)
+          for name, pat in (('dismissDecoy', r'\+ \(void\)dismissDecoy \{.*?DLResumeBiometric\(\)'),
+                            ('forceTeardown', r'\+ \(void\)forceTeardown \{.*?DLResumeBiometric\(\)')):
+              if not re.search(pat, ctl_nc, re.S):
+                  print("❌ %s 里没有恢复 Face ID（漏了这条路径 = 用户 Face ID 被永久关死）" % name)
+                  sys.exit(1)
+
+          # 兜底守护 + 硬上限必须都在
+          if 'DLBioGuardTick' not in ctl_nc or '180.0' not in ctl_nc:
+              print("❌ 缺少 Face ID 兜底守护 / 180 秒硬上限（最后的保险丝）")
+              sys.exit(1)
+
+          print("✅ Face ID 暂停/恢复链路完整（%d 个恢复点 + 兜底守护 + 硬上限）" % resume_sites)
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"
