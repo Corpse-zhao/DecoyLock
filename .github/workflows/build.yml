@@ -305,6 +305,29 @@ jobs:
           print("✅ plist 的 action 全部有实现（%d 个）" % len(actions))
           PY
 
+          echo "--- 检查 16：⭐ 提交点 attemptUnlockWithPasscode: 必须真的拦截，不能只打日志就放行 ---"
+          # 2026-10-06 用户实测：「按假密码，按完最后一位数字，还是要刷脸才能进假空间」。
+          #   根因 = 这个钩子（系统把密码送去校验的地方）只打了行日志就 %orig 放行，
+          #   我们在按键层吞掉一位并不能拦住所有输入路径 → 系统照常拿到完整伪密码
+          #   → 判错 → 弹刷脸。正解是命中伪密码时**提前 return，不调 %orig**。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          t = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          m = re.search(r'- \(void\)attemptUnlockWithPasscode:.*?\n\}', t, re.S)
+          if not m:
+              print("❌ Tweak.x 里找不到 attemptUnlockWithPasscode: 钩子")
+              sys.exit(1)
+          code = re.sub(r'//[^\n]*', '', m.group(0))
+          if 'DLDecoyPasscode()' not in code or '%orig' not in code:
+              print("❌ 提交点钩子里缺少伪密码比对或 %orig（写法异常）")
+              sys.exit(1)
+          if not re.search(r'isEqualToString:DLDecoyPasscode\(\).*?return;', code, re.S):
+              print("❌ 提交点没有「命中伪密码 → 提前 return（不 %orig）」")
+              print("   → 系统仍会校验伪密码 → 判错 → 弹刷脸（用户已实测两轮）")
+              sys.exit(1)
+          print("✅ 提交点已真正拦截伪密码（不刷脸的关键）")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

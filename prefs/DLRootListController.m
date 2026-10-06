@@ -30,7 +30,7 @@ static NSString *const kDLDomain = @"com.blr.decoylock";
 //       拿不到 DLCommon.h 里的 DL_VERSION。
 //    诊断页会拿它跟「插件启动横幅」里的版本对比，
 //    一眼看出 SpringBoard 里跑的到底是不是新版。
-static NSString *const kDLPrefsVersion = @"0.1.20";
+static NSString *const kDLPrefsVersion = @"0.1.21";
 
 // ---------------------------------------------------------------------------
 // 配置读写（共享目录 + NSUserDefaults，SpringBoard 侧可读）
@@ -410,31 +410,42 @@ static void DLDoRespring(void) {
     //   运行版本 = 插件 dylib 版本（只有重启桌面才会更新）。
     //   两者不一致 → 100% 是「装了新版但没重启桌面」，不用再猜。
     {
+        // ⚠️ v0.1.21 修正：探针文件是**追加式**的，每启动一次桌面就多一条横幅。
+        //    旧代码从文件**开头**找第一条就 break —— 那是最旧的那条，
+        //    设备重启/重启桌面几次之后就会报出一个**过期的版本号**，
+        //    反而把人误导成「版本一致」。必须**从后往前**取最新一条。
+        NSArray<NSString *> *allLines = [raw componentsSeparatedByString:@"\n"];
         NSString *runningVer = @"(未检测到)";
-        for (NSString *ln in [raw componentsSeparatedByString:@"\n"]) {
+        NSInteger bannerCount = 0;
+        for (NSInteger i = (NSInteger)allLines.count - 1; i >= 0; i--) {
+            NSString *ln = allLines[(NSUInteger)i];
             if ([ln rangeOfString:@"DecoyLock"].location == NSNotFound) continue;
             if ([ln rangeOfString:@"启动"].location == NSNotFound) continue;
             NSRange r = [ln rangeOfString:@"DecoyLock "];
             if (r.location == NSNotFound) continue;
+            bannerCount++;
+            if (bannerCount > 1) continue;      // 只取最新一条，继续往下数条数
             NSString *tail = [ln substringFromIndex:NSMaxRange(r)];
             NSRange sp = [tail rangeOfString:@" "];
             runningVer = (sp.location == NSNotFound)
                 ? [tail stringByTrimmingCharactersInSet:
                        [NSCharacterSet whitespaceAndNewlineCharacterSet]]
                 : [tail substringToIndex:sp.location];
-            break;
         }
 
         BOOL same = [runningVer isEqualToString:kDLPrefsVersion];
         if (same) {
             [lines addObject:[NSString stringWithFormat:
-                @"版本: 面板 %@ ／ 插件 %@ ✅ 一致", kDLPrefsVersion, runningVer]];
+                @"版本: 面板 %@ ／ 插件 %@ ✅ 一致（启动横幅 %ld 条，取最新）",
+                kDLPrefsVersion, runningVer, (long)bannerCount]];
         } else {
             [lines addObject:@"⚠️⚠️ 版本不一致 —— 插件没生效的直接原因 ⚠️⚠️"];
             [lines addObject:[NSString stringWithFormat:
                 @"  面板版本 = %@（设置页是新版）", kDLPrefsVersion]];
             [lines addObject:[NSString stringWithFormat:
-                @"  插件版本 = %@（SpringBoard 里跑的）", runningVer]];
+                @"  插件版本 = %@（SpringBoard 里跑的，取最新横幅）", runningVer]];
+            [lines addObject:[NSString stringWithFormat:
+                @"  启动横幅共 %ld 条", (long)bannerCount]];
             [lines addObject:@"  → 说明装了新版但 SpringBoard 还在跑旧代码。"];
             [lines addObject:@"  → 修法：点上面「重启桌面生效」，或手动 respring。"];
         }
@@ -607,7 +618,13 @@ static void DLDoRespring(void) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 0) return (NSInteger)DLFakeApps().count;
+    // ⭐ v0.1.21：从「选择退出用的 App」进来时，**第 0 节整段收起**。
+    //    否则用户看到的还是那张「勾选 App」的列表 —— 与历史页面一模一样，
+    //    极易被误判成「点了没反应 / 还是老页面 / 打不开」。
+    //    从「选择要显示的 App」进来时行为完全不变（两节都显示）。
+    if (s == 0) {
+        return self.focusExitSection ? 0 : (NSInteger)DLFakeApps().count;
+    }
     return (NSInteger)DLFakeApps().count + 1;   // ⭐ 第 1 节第 0 行 = 「不设置」
 }
 
@@ -629,7 +646,10 @@ static void DLDoRespring(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
-    if (s == 0) return @"勾选后显示在假空间里，点右上角「完成」保存";
+    if (s == 0) {
+        // v0.1.21：从退出入口进来时第 0 节是空的，标题也去掉
+        return self.focusExitSection ? nil : @"勾选后显示在假空间里，点右上角「完成」保存";
+    }
     return @"在假空间里点下面这个 App 即退出（点一下即生效）";
 }
 

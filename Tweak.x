@@ -1267,7 +1267,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.20 安全加固版 + 退出App选择修复）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.21 提交点拦截 + 退出入口修复）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1468,9 +1468,40 @@ static void DLLogInputCapture(NSString *src) {
     %orig;
 }
 
-// 保留：老的判定点（若某些系统版本真的走它，仍能生效）
+// ⭐⭐ v0.1.21：这里是**提交点** —— 系统把密码送去校验的地方。
+//
+//     事故背景（用户实测）：「按假密码，按完最后一位数字，还是要刷脸才能进假空间」。
+//     根因：v0.1.17~v0.1.20 在这儿**只打了行日志就 %orig 放行**。
+//     我们在 appendString: 里吞掉最后一位只在「按键逐步输入」这一条路上有效；
+//     而系统实际拿到密码的路径不止一条（setText / 自动填充 / 内部状态同步），
+//     于是它**照常拿到完整伪密码并校验 → 判错 → 弹刷脸**。
+//
+//     正解：在提交点直接比对 —— 命中伪密码就 **不调 %orig**，
+//     让系统根本收不到这次提交 → 无「密码错误」、无刷脸、不计入锁定惩罚。
+//     （吞键继续保留，两条路互为保险。）
 - (void)attemptUnlockWithPasscode:(id)passcode {
-    DLProbe(@"[解锁请求] attemptUnlockWithPasscode: 被调用 passcode=%@", passcode);
+    NSString *p = nil;
+    if ([passcode isKindOfClass:[NSString class]]) {
+        p = (NSString *)passcode;
+    } else if ([passcode respondsToSelector:@selector(description)]) {
+        p = [passcode description];
+    }
+    DLProbe(@"[提交点] attemptUnlockWithPasscode: 被调用 passcode=%@ len=%lu",
+            p.length ? p : @"(无法取到明文)", (unsigned long)p.length);
+
+    if (p.length && DLEnabled() && DLDecoyPasscode().length &&
+        [p isEqualToString:DLDecoyPasscode()]) {
+        DLProbe(@"★★ [提交点拦截] 提交的是伪密码 → 本次提交不交给系统"
+                @"（无密码错误 / 无刷脸 / 无锁定惩罚）");
+        DLResetInput();
+        if (![DLDecoyController isShowing]) {
+            [DLDecoyController handleCapturedPasscode:p];
+        } else {
+            DLProbe(@"[提交点拦截] 假空间已在展示 → 不重复呈现");
+        }
+        return;          // ⚠️ 绝不 %orig：这就是「不刷脸」的关键
+    }
+
     %orig;
 }
 
