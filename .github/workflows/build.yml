@@ -520,9 +520,9 @@ jobs:
                   sys.exit(1)
 
           # 第二个 unlockWithRequest 变体
-          if twk_nc.count('DLPinnedToLockScreen()') < 3:
-              print("❌ DLPinnedToLockScreen() 出现不到 3 处 —— 两个 unlockWithRequest")
-              print("   变体 + HandleUnlockAttemptSucceeded 都应拦截")
+          if twk_nc.count('DLPinnedToLockScreen()') < 5:
+              print("❌ DLPinnedToLockScreen() 出现不到 5 处")
+              print("   v0.2.3 起应至少 5 处：3 处解锁请求/成功回调 + Mesa 回调 + 锁屏收场")
               sys.exit(1)
 
           # (d) 必须能退出贴纸模式
@@ -675,6 +675,47 @@ jobs:
           if bad:
               sys.exit(1)
           print("✅ 无「声明了却没用」的文件作用域 static 变量")
+          PY
+
+          echo "--- 检查 22：⭐⭐⭐ 必须 hook「日志证实的真实解锁路径」 ---"
+          # v0.2.2 真机日志血泪：我们 hook 的三个解锁方法
+          #   coverSheetViewController:unlockWithRequest:completion:
+          #   coverSheetViewControllerHandleUnlockAttemptSucceeded:
+          #   coverSheetPresentationManager:unlockWithRequest:completion:
+          # 在真机上**一次都没被调用**（日志 0 次）—— 这些方法名在 iOS 16.6 上
+          # 根本不存在，Logos 静默丢弃 → 拦截逻辑一直是**死代码**，刷脸从未被拦住。
+          # 同一份日志的 [侦查] 行给出了真实路径：
+          #   CSPasscodeViewController -passcodeLockViewPasscodeEnteredViaMesa:（Mesa=Face ID）
+          #   CSCoverSheetViewController -updateStatusBarForLockScreenTeardown（锁屏收场）
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          twk = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          # 剥注释，只认真实代码
+          twk_nc = re.sub(r'//[^\n]*', '', twk)
+          twk_nc = re.sub(r'/\*.*?\*/', '', twk_nc, flags=re.S)
+
+          if 'passcodeLockViewPasscodeEnteredViaMesa:' not in twk_nc:
+              print("❌ Tweak.x 未 hook passcodeLockViewPasscodeEnteredViaMesa:")
+              print("   这是日志证实的 Face ID/Mesa 解锁成功回调 = 「刷脸」真身")
+              sys.exit(1)
+          if 'updateStatusBarForLockScreenTeardown' not in twk_nc:
+              print("❌ Tweak.x 未 hook updateStatusBarForLockScreenTeardown（锁屏收场信号）")
+              sys.exit(1)
+
+          for meth, label in [('passcodeLockViewPasscodeEnteredViaMesa:', 'Mesa 回调'),
+                              ('updateStatusBarForLockScreenTeardown', '锁屏收场')]:
+              m = re.search(r'-\s*\(void\)\s*' + re.escape(meth) + r'.*?\n\}', twk_nc, re.S)
+              if not m:
+                  continue
+              body = m.group(0)
+              if 'DLPinnedToLockScreen()' not in body:
+                  print("❌ %s 的 hook 里没有 DLPinnedToLockScreen() 守卫" % label)
+                  sys.exit(1)
+              if not re.search(r'DLPinnedToLockScreen\(\).*?return;', body, re.S):
+                  print("❌ %s 的 hook 没有提前 return（没真正吞掉解锁）" % label)
+                  sys.exit(1)
+          print("✅ 真实解锁路径已拦截（Mesa 回调 + 锁屏收场）")
           PY
 
           if [ "$FAIL" -ne 0 ]; then

@@ -1560,6 +1560,70 @@ static void DLLogInputCapture(NSString *src) {
 %end
 
 // ---------------------------------------------------------------------------
+// ⭐⭐⭐ v0.2.3：补上「日志证实的真实解锁路径」上的拦截
+//
+// 🔥🔥🔥 v0.2.2 真机日志的**最重要发现**：上面那三个解锁拦截点
+//    （`coverSheetViewController:unlockWithRequest:completion:` /
+//      `coverSheetViewControllerHandleUnlockAttemptSucceeded:` /
+//      `coverSheetPresentationManager:unlockWithRequest:completion:`）
+//    在这台机器上**一次都没有被调用**（日志里 0 次）——
+//    也就是说这些方法名在 iOS 16.6 上**根本不存在**，Logos 静默丢弃了它们，
+//    我们的「不解锁真机」逻辑其实**一直是死代码**。
+//
+// 而日志同时给出了**真正发生的解锁路径**（这些 `[侦查]` 行是通用转发器
+// 实时上报的、真实被调用的方法）：
+//     CSPasscodeViewController -passcodeLockViewPasscodeEnteredViaMesa:   ← Mesa = Face ID 代号
+//     SBLockScreenManager      -homeButtonSuppressAfterUnlockRecognizerRequestsEndOfSuppression:
+//     CSCoverSheetViewController -updateStatusBarForLockScreenTeardown    ← 锁屏开始收场
+//     → SBCoverSheetWindow hidden=1                                        ← 锁屏消失 = 真机已解锁
+//
+// ⭐⭐ 关键认识：`passcodeLockViewPasscodeEnteredViaMesa:` 是**Face ID 成功路径**
+//    的回调。它出现 = 系统认可了一次生物识别解锁。**这才是「刷脸」的真身** ——
+//    不是「Face ID 弹了窗口」，而是「系统走了 Face ID 解锁成功分支」。
+//    光去停用 Face ID 匹配（不管调对没调对）**都拦不住它** ——
+//    必须在它**发生的这一刻**把解锁拦下来。
+//
+// 所以本版把 hook 打在日志证实的**真实方法**上。
+// ---------------------------------------------------------------------------
+
+@interface CSPasscodeViewController : NSObject
+@end
+
+%hook CSPasscodeViewController
+
+// Face ID（Mesa）解锁成功回调 —— 「刷脸」的真身
+- (void)passcodeLockViewPasscodeEnteredViaMesa:(id)mesa {
+    DLProbe(@"[Mesa] ⭐ passcodeLockViewPasscodeEnteredViaMesa: 被调用（Face ID 解锁成功路径）");
+
+    // 判据：只有「假空间正在以贴纸形态展示」时才拦 —— 其余一律放行，绝不影响正常使用。
+    if (DLEnabled() && [DLDecoyController isShowing] && DLPinnedToLockScreen()) {
+        DLProbe(@"★★ [锁屏贴纸] 拦截 Mesa（Face ID）解锁成功回调 → **真机保持锁定、不刷脸**");
+        // ⚠️ 不做 %orig：系统收不到「Face ID 解锁成功」，锁屏不会收场。
+        return;
+    }
+    %orig;
+}
+
+%end
+
+@interface CSCoverSheetViewController : NSObject
+@end
+
+%hook CSCoverSheetViewController
+
+// 锁屏开始收场（teardown）—— 真机即将解锁的强信号
+- (void)updateStatusBarForLockScreenTeardown {
+    DLProbe(@"[收场] ⭐ updateStatusBarForLockScreenTeardown 被调用（锁屏开始收场）");
+    if (DLEnabled() && [DLDecoyController isShowing] && DLPinnedToLockScreen()) {
+        DLProbe(@"★★ [锁屏贴纸] 拦截「锁屏收场」→ 真机保持锁定");
+        return;    // 不 %orig：不让状态栏进入收场动画，锁屏不退场
+    }
+    %orig;
+}
+
+%end
+
+// ---------------------------------------------------------------------------
 // ⭐ v0.1.14：失败回调 —— **兜底**判定点（不再只是日志）
 //
 // 主路径是「输入够位数就主动判定」（见 DLTriggerActiveVerdict）。
