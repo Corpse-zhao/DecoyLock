@@ -212,6 +212,9 @@ static CGFloat DLMaxOtherWindowLevel(void) {
         return DLPasscodeVerdictDecoy;
     }
 
+    // ⭐ v0.1.18：新一轮命中 → 解除「用户已退出」状态，守护循环重新待命
+    sUserDismissed = NO;
+
     // 关键：双保险（v0.1.15 重做）。
     //   ① 立刻异步呈现（赶在系统「密码错误」动画之前把假空间铺上去）
     //   ② 呈现后启动 15 秒守护循环：每 0.5 秒查一次，窗口被系统隐藏/移除
@@ -228,6 +231,11 @@ static CGFloat DLMaxOtherWindowLevel(void) {
 #pragma mark - ⭐ v0.1.15 窗口守护（自愈 + 根因取证）
 
 static BOOL sKeeperActive = NO;
+// ⭐ v0.1.18：区分「窗口被系统弄没了（要复活）」和「用户自己点退出了（不许复活）」
+//   用户反馈：「点设置退出，在真系统跟假空间之间来回闪，好多次才退出」
+//   → 根因就是守护循环分不清这两者：用户主动退出后 0.5 秒内又被复活，
+//     用户必须连点到 15 秒守护窗口结束才真正退出。
+static BOOL sUserDismissed = NO;
 
 // 启动守护循环：0.5 秒 × 30 次 = 覆盖呈现后最初 15 秒
 // （实测窗口正是在呈现后 ~1.2 秒被系统动掉的，15 秒足够跨过 CoverSheet 重置期）
@@ -238,6 +246,14 @@ static BOOL sKeeperActive = NO;
 }
 
 + (void)keeperTick:(NSInteger)n {
+    // ⭐ v0.1.18：用户已主动退出 → 立刻收工，绝不再复活
+    if (!sKeeperActive) return;
+    if (sUserDismissed) {
+        sKeeperActive = NO;
+        DLProbe(@"[守护] 用户已主动退出 → 守护结束，不再复活");
+        return;
+    }
+
     if (![DLDecoyController isShowing]) {
         // ⭐ 取证优先：把「窗口到底怎么了」写进日志，下一轮排查直接看根因
         NSString *state;
@@ -462,6 +478,12 @@ static UIWindowScene *DLSceneOwningTopWindow(void) {
 + (void)dismissDecoy {
     if (!sShared) return;
     DLProbe(@"decoy 退出假空间");
+    // ⭐ v0.1.18：先立「用户主动退出」标记 —— 守护循环看到它就会立刻收工，
+    //    否则用户点一次退出会被守护循环在 0.5 秒内复活（表现为反复闪）。
+    sUserDismissed = YES;
+    sKeeperActive = NO;
+    DLProbe(@"[守护] 标记用户退出：后续不再自动复活");
+
     UIWindow *win = sShared.view.window ?: sWindow;   // v0.1.15：兜底取强持有的窗口
     sShared = nil;
     sWindow = nil;

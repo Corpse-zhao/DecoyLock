@@ -63,6 +63,38 @@ static void DLPrefsSave(NSDictionary *cfg) {
     notify_post("com.blr.decoylock/prefschanged");
 }
 
+// ---------------------------------------------------------------------------
+// ⚠️ 设置进程里**不能**用插件的 DLProbe（那个实现在 DecoyLock.dylib 里，
+//    「设置」进程根本不加载它 → 链接不到）。这里自己写一份，格式与插件端一致，
+//    这样两边日志都落在同一个 _probe.txt 里，排查时一眼能对上时间线。
+// ---------------------------------------------------------------------------
+static void DLPrefsLog(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@ (pid %d)\n",
+                      [df stringFromDate:[NSDate date]], body, (int)getpid()];
+
+    NSString *path = DLPrefsProbePath();
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        [data writeToFile:path atomically:YES];
+        return;
+    }
+    NSFileHandle *h = [NSFileHandle fileHandleForUpdatingAtPath:path];
+    if (h) {
+        [h seekToEndOfFile];
+        [h writeData:data];
+        [h closeFile];
+    }
+}
+
 // 内置假 App 清单（与插件端 DLCommon.m 的 DLAllFakeApps 保持一致）
 static NSArray *DLFakeApps(void) {
     return @[
@@ -131,6 +163,29 @@ static NSArray *DLDefaultSelection(void) {
     if (!key.length) return;
     NSMutableDictionary *cfg = DLPrefsLoad();
     cfg[key] = value;
+
+    // ⭐ v0.1.18：换了退出 App → 自动把它加进「显示的 App」列表。
+    // 否则用户选了「设置」但假空间里没显示设置，会以为功能坏了。
+    if ([key isEqualToString:@"decoy_exit_app"]) {
+        DLPrefsLog(@"[设置] 退出App 改为「%@」", value);
+        if ([value isKindOfClass:[NSString class]] && [(NSString *)value length]) {
+            NSArray *cur = cfg[@"decoy_apps"];
+            if (![cur isKindOfClass:[NSArray class]] || !cur.count) cur = DLDefaultSelection();
+            if (![cur containsObject:value]) {
+                NSMutableArray *ordered = [NSMutableArray array];
+                for (NSDictionary *a in DLFakeApps()) {
+                    NSString *aid = a[@"id"];
+                    if ([aid isEqualToString:value] || [cur containsObject:aid]) {
+                        [ordered addObject:aid];
+                    }
+                }
+                cfg[@"decoy_apps"] = ordered;
+                DLPrefsLog(@"[设置] 已把「%@」自动加入显示列表（共 %lu 个）",
+                           value, (unsigned long)ordered.count);
+            }
+        }
+    }
+
     DLPrefsSave(cfg);
 
     if ([key isEqualToString:@"decoy_passcode"]) {
@@ -250,12 +305,11 @@ static void DLDoRespring(void) {
     [self.navigationController pushViewController:vc animated:YES];
 }
 
-// ⭐ v0.1.16：退出 App 选择器
-- (void)pushExitAppPicker:(PSSpecifier *)spec {
-    DLExitAppPickerController *vc = [[DLExitAppPickerController alloc]
-        initWithStyle:UITableViewStyleInsetGrouped];
-    [self.navigationController pushViewController:vc animated:YES];
-}
+// ⚠️ v0.1.18：原来这里有个自建的「退出 App 选择器」（DLExitAppPickerController）。
+//    用户反馈「点击不了、不能切换 App」→ 已删除自建表格方案，
+//    改用 Root.plist 里的 **PSMultiValueSpecifier**（Preferences 框架自带的
+//    多值选择器）。框架原生实现，点击/勾选/返回全由系统处理，最稳。
+//    选中值通过 -setPreferenceValue:specifier: 落到我们自己的配置里（见上）。
 
 @end
 
@@ -475,98 +529,6 @@ static void DLDoRespring(void) {
 
 @end
 
-#pragma mark - ⭐ v0.1.16 退出 App 选择器（单选，点一下即保存并返回）
-// 背景：用户反馈「好难退出去」——原来的隐藏退出（标题连点 8 次 / 长按壁纸 3 秒）
-// 太难记住。改成在假空间里点指定 App 直接退出，这里选是哪个 App。
-//
-// ⚠️ 关键一步：保存时若该 App 不在「展示的 App」列表里，**自动加进去** ——
-//    否则用户选了「设置」但假空间里没显示设置，会以为功能坏了。
-
-@implementation DLExitAppPickerController
-
-- (NSArray *)rows {
-    NSMutableArray *r = [NSMutableArray array];
-    // 第 0 行 = 关闭该功能（只能用隐藏手势）
-    [r addObject:@{@"id": @"", @"name": @"不设置（仅用隐藏手势退出）"}];
-    for (NSDictionary *a in DLFakeApps()) {
-        [r addObject:@{@"id": a[@"id"], @"name": a[@"name"]}];
-    }
-    return r;
-}
-
-- (NSString *)currentExitID {
-    id v = DLPrefsLoad()[@"decoy_exit_app"];
-    if ([v isKindOfClass:[NSString class]]) return v;
-    return @"settings";      // 与插件端 DLDecoyExitApp() 的默认值保持一致
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"点哪个 App 退出";
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self.tableView reloadData];
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return (NSInteger)[self rows].count;
-}
-
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
-    return @"在假空间里点这个 App 即退出。点一下即保存（已自动勾选为显示）。";
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    static NSString *cellID = @"DLExitAppCell";
-    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cellID];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
-                                      reuseIdentifier:cellID];
-    }
-    NSArray *rows = [self rows];
-    if (ip.row < 0 || ip.row >= (NSInteger)rows.count) return cell;
-
-    NSString *ident = rows[(NSUInteger)ip.row][@"id"];
-    cell.textLabel.text = rows[(NSUInteger)ip.row][@"name"];
-    cell.accessoryType = [ident isEqualToString:[self currentExitID]]
-        ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
-    return cell;
-}
-
-- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    [tv deselectRowAtIndexPath:ip animated:YES];
-    NSArray *rows = [self rows];
-    if (ip.row < 0 || ip.row >= (NSInteger)rows.count) return;
-
-    NSString *ident = rows[(NSUInteger)ip.row][@"id"];
-    NSMutableDictionary *cfg = DLPrefsLoad();
-    cfg[@"decoy_exit_app"] = ident;
-
-    // ⚠️ 自动把选中的 App 加进展示列表 —— 否则假空间里根本看不到它
-    if (ident.length) {
-        NSArray *cur = cfg[@"decoy_apps"];
-        if (![cur isKindOfClass:[NSArray class]] || !cur.count) cur = DLDefaultSelection();
-        if (![cur containsObject:ident]) {
-            NSMutableArray *ordered = [NSMutableArray array];
-            for (NSDictionary *a in DLFakeApps()) {
-                NSString *aid = a[@"id"];
-                if ([aid isEqualToString:ident] || [cur containsObject:aid]) {
-                    [ordered addObject:aid];
-                }
-            }
-            cfg[@"decoy_apps"] = ordered;
-        }
-    }
-
-    DLPrefsSave(cfg);
-    [self.navigationController popViewControllerAnimated:YES];
-}
-
-@end
 
 #pragma mark - 纯原生文本编辑页（替代 PSTextFieldSpecifier）
 // ⚠️ 布局用 NSLayoutConstraint 锚定 safeArea —— 绝不在 viewDidLoad 里用
