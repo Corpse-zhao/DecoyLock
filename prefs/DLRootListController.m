@@ -30,7 +30,7 @@ static NSString *const kDLDomain = @"com.blr.decoylock";
 //       拿不到 DLCommon.h 里的 DL_VERSION。
 //    诊断页会拿它跟「插件启动横幅」里的版本对比，
 //    一眼看出 SpringBoard 里跑的到底是不是新版。
-static NSString *const kDLPrefsVersion = @"0.1.19";
+static NSString *const kDLPrefsVersion = @"0.1.20";
 
 // ---------------------------------------------------------------------------
 // 配置读写（共享目录 + NSUserDefaults，SpringBoard 侧可读）
@@ -142,7 +142,8 @@ static NSArray *DLDefaultSelection(void) {
 //   （v0.1.16 手搓控制器点不了、v0.1.18 换 PSMultiValueSpecifier 还是点不了，
 //    用户实测两轮都一样）。而这个页面是**已经验证能正常打开、能正常点击**的，
 //    把设置项挂进已验证的页面里，是唯一稳妥的做法。
-@property (nonatomic, assign) BOOL focusExitSection;   // 从「点哪个 App 退出」进来时滚动到第 1 节
+//   入口传 focusExitSection=YES 即从「退出」侧进入（v0.1.20 起该入口是个按钮行）。
+@property (nonatomic, assign) BOOL focusExitSection;   // 从「选择退出用的 App」进来时滚动到第 1 节
 @end
 
 #pragma mark - 主面板
@@ -324,22 +325,48 @@ static void DLDoRespring(void) {
 //    Preferences 框架对 detail 控制器有 PSListController 体系假设，
 //    给纯原生 UITableViewController 会在框架内部实例化时崩溃（用户实测闪退）。
 - (void)pushAppPicker:(PSSpecifier *)spec {
+    DLPrefsLog(@"[设置] ✅ 点中「选择要显示的 App」（action 已触发）");
     DLAppPickerController *vc = [[DLAppPickerController alloc]
         initWithStyle:UITableViewStyleInsetGrouped];
     [self.navigationController pushViewController:vc animated:YES];
 }
 
-// ⭐ v0.1.19：退出 App 的选择**并进同一个页面**（第二节）。
-//    历史教训：v0.1.16 用独立的自建控制器 → 用户说「点击不了」；
-//    v0.1.18 换成框架原生的 PSMultiValueSpecifier → 用户说还是「点击不了」。
-//    两次都失败，说明问题不在控制器写法（同一个写法在 App 勾选页是好用的）。
-//    既然如此，就别再赌第三个未知 specifier 了 —— 直接把这一项放进
-//    **已经验证能打开、能点击**的那个页面里，从根上绕开这个坑。
-- (void)pushExitAppPicker:(PSSpecifier *)spec {
+// ⭐⭐ v0.1.20：第三次返工 —— 改用**与「重启桌面生效 / 查看运行诊断」完全同款**的
+//      `PSButtonCell` + **无参** action。
+//
+//     为什么是这套：
+//     - 用户实测「重启桌面生效」「查看运行诊断」「清除诊断日志」这三个按钮**都能点**，
+//       它们就是 PSButtonCell + 无参 action（`respring` / `showProbe` / `clearProbe`）。
+//     - 而「选择要显示的 App」「设置伪密码」是 PSLinkCell + 带参 selector，也能点。
+//     - 唯独「点哪个 App 退出」这一行，先后用过
+//         v0.1.16 自建控制器（detail 键）        → 点不动 / 闪退
+//         v0.1.18 PSMultiValueSpecifier          → 点不动
+//         v0.1.19 PSLinkCell + 带参 action       → 点不动
+//       三种写法都失败，且 v0.1.19 的 plist 定义与**同页能用的那一行逐字段完全一致**
+//       （已逐字段 dump 比对）—— 静态代码层面无法定位。
+//       既然如此，就换成**在用户本机已被证明可用**的那一套（PSButtonCell + 无参 action），
+//       不再赌第四种写法。
+//
+//     另外这里带了两道自检日志：
+//       ① 进入方法即写日志 → 能确证 action 到底有没有被触发；
+//       ② push 前检查 navigationController，为 nil 就退回 present，
+//          避免「action 触发了但 push 不出去」造成的静默失败。
+- (void)dlPickExitApp {
+    DLPrefsLog(@"[设置] ✅ 点中「选择退出用的 App」（action 已触发）");
+
     DLAppPickerController *vc = [[DLAppPickerController alloc]
         initWithStyle:UITableViewStyleInsetGrouped];
-    vc.focusExitSection = YES;      // 进来直接滚到「点哪个 App 退出」那一节
-    [self.navigationController pushViewController:vc animated:YES];
+    vc.focusExitSection = YES;      // 进来直接滚到「退出 App」那一节
+
+    UINavigationController *nav = self.navigationController;
+    DLPrefsLog(@"[设置] navigationController = %@", nav ? @"存在" : @"nil(!)");
+    if (nav) {
+        [nav pushViewController:vc animated:YES];
+    } else {
+        // 兜底：拿不到导航栈就直接模态呈现，绝不静默失败
+        DLPrefsLog(@"[设置] ⚠️ 导航栈不可用 → 改用 present 呈现");
+        [self presentViewController:vc animated:YES completion:nil];
+    }
 }
 
 @end
@@ -534,7 +561,8 @@ static void DLDoRespring(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = self.focusExitSection ? @"点哪个 App 退出" : @"假空间 App 与退出";
+    self.title = self.focusExitSection ? @"选择退出用的 App" : @"假空间 App 与退出";
+    DLPrefsLog(@"[设置] App 选择页已打开（focusExitSection=%d）", (int)self.focusExitSection);
 
     NSMutableDictionary *cfg = DLPrefsLoad();
     NSArray *cur = cfg[@"decoy_apps"];

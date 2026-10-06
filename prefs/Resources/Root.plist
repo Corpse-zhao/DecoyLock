@@ -55,9 +55,9 @@
             "footerText": "在假空间里点下面选定的这个 App 即退出（默认「设置」）。若它没被勾选为显示，选中后会自动加入显示列表。"
         },
         {
-            "cell": "PSLinkCell",
-            "label": "点哪个 App 退出",
-            "action": "pushExitAppPicker:"
+            "cell": "PSButtonCell",
+            "label": "选择退出用的 App",
+            "action": "dlPickExitApp"
         },
         {
             "cell": "PSGroupCell",
@@ -82,7 +82,7 @@
         {
             "cell": "PSGroupCell",
             "label": "",
-            "footerText": "伪锁屏 v0.1.19 · 作者 板栗仁"
+            "footerText": "伪锁屏 v0.1.20 · 作者 板栗仁"
         }
     ]
 }

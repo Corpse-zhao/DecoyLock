@@ -283,6 +283,28 @@ jobs:
             echo "✅ 吞键有保护阀"
           fi
 
+          echo "--- 检查 15：⭐ Root.plist 里的 action 必须在设置页类里真有实现 ---"
+          # 2026-10-06 教训：设置项「点哪个 App 退出」连续两版点不动。
+          #   排查时发现：Preferences 框架对「plist 写了 action、但方法名打错或忘了实现」
+          #   **不会报任何错**，只是点了毫无反应 —— 纯静态看代码根本看不出来，
+          #   只能靠用户一轮轮实测，代价极高。
+          #   这条交叉校验把这类确定性错误挡在编译前。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          p = io.open('prefs/Resources/Root.plist', encoding='utf-8', errors='replace').read()
+          m = io.open('prefs/DLRootListController.m', encoding='utf-8', errors='replace').read()
+          actions = set(re.findall(r'"action"\s*:\s*"([^"]+)"', p))
+          code = re.sub(r'//[^\n]*', '', m)
+          methods = set(re.findall(r'^\s*-\s*\([^)]*\)\s*([A-Za-z_][A-Za-z0-9_]*)', code, re.M))
+          bad = [a for a in sorted(actions) if a.split(':')[0] not in methods]
+          if bad:
+              print("❌ Root.plist 里这些 action 在 DLRootListController.m 里没有实现：")
+              for a in bad:
+                  print("     - %s" % a)
+              sys.exit(1)
+          print("✅ plist 的 action 全部有实现（%d 个）" % len(actions))
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"
