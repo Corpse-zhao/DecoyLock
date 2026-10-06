@@ -347,18 +347,35 @@ jobs:
           ctl_nc = re.sub(r'//[^\n]*', '', ctl)
 
           # (c) 实现层的安全保护
-          #   ⭐ v0.2.1：不再钉死某个类/方法名 —— v0.2.0 钉死 SBUIBiometricResource
-          #   + setMatchingEnabled: 本身就是错的（真机没有这个方法名，iOS 16 要
-          #   SBUIBiometricEventMonitor -_setMatchingEnabled:）。
-          #   改为断言「多路径探测 + 每条路径逐一 respondsToSelector 保护」这个结构。
-          if 'SBUIBiometricEventMonitor' not in common_m:
-              print("❌ DLCommon.m 找不到 SBUIBiometricEventMonitor")
-              print("   → iOS 16 上只有它（-_setMatchingEnabled:）能真正停掉 Face ID 匹配")
+          #   ⭐⭐⭐ v0.2.2：**不再断言任何手写的类名/方法名**（这已经连续失败两轮了：
+          #   ① v0.2.0 钉死 SBUIBiometricResource + setMatchingEnabled: → 真机没有；
+          #   ② v0.2.1 钉死 SBUIBiometricEventMonitor + _setMatchingEnabled: → 真机也不命中）。
+          #   而且断言**能被注释里的字面串骗过去**（假绿！）—— v0.2.1 的检查就是这么过的。
+          #   现在只断言「运行时侦查」这个结构本身，注释不算数。
+          common_m_nc = re.sub(r'//[^\n]*', '', common_m)
+          if 'objc_getClassList' not in common_m_nc:
+              print("❌ DLCommon.m 没有 objc_getClassList → Face ID 停用没走运行时侦查，")
+              print("   又退回手写清单（v0.2.0/v0.2.1 两次不生效的根因）")
               sys.exit(1)
-          if 'SBUIBiometricResource' not in common_m:
-              print("❌ DLCommon.m 找不到 SBUIBiometricResource（旧版本兼容路径缺失）")
+          if 'class_getSuperclass' not in common_m_nc:
+              print("❌ DLCommon.m 未沿继承链（class_getSuperclass）找 setter")
+              print("   → 定义在父类上的 _setMatchingEnabled: 会被漏掉")
               sys.exit(1)
-          if not re.search(r'respondsToSelector:\s*sel\]', common_m):
+          if 'class_copyMethodList' not in common_m_nc:
+              print("❌ DLCommon.m 未用 class_copyMethodList 枚举方法 → 无法发现真实 setter")
+              sys.exit(1)
+          if 'object_getClass(' in common_m_nc:
+              print("❌ DLCommon.m 出现 object_getClass( —— 侦查方法时必须用 [inst class]，")
+              print("   元类上列不出实例 setter（会静默找不到任何候选）")
+              sys.exit(1)
+          if 'DLBioInstancesFor' not in common_m_nc:
+              print("❌ DLCommon.m 缺少 DLBioInstancesFor：侦查与调用没有共用实例解析 →")
+              print("   两边可能解析出不同对象（日志说找到 setter 却调不到）")
+              sys.exit(1)
+          if '[FaceID][侦查]' not in common_m:
+              print("❌ DLCommon.m 没有 [FaceID][侦查] 日志 → 侦查结果不可见，失败时无法定位")
+              sys.exit(1)
+          if not re.search(r'respondsToSelector:\s*sel\]', common_m_nc):
               print("❌ DLCommon.m 未对候选 setter 逐个做 respondsToSelector:sel 保护")
               print("   → 不同 iOS 版本可能没有这个方法，直接调会崩进程")
               sys.exit(1)
@@ -534,22 +551,41 @@ jobs:
               print("❌ DLLockScreenWindowLevel 没有「优先采信 key window」的分支")
               sys.exit(1)
 
-          # (f) ⭐⭐⭐ v0.2.1：Face ID 必须走 iOS 16 真实入口
-          #   `SBUIBiometricEventMonitor -_setMatchingEnabled:`
-          #   血泪：v0.2.0 只试 SBUIBiometricResource + setMatchingEnabled:
-          #   → 真机日志一路「实例不支持 setMatchingEnabled:」→ 暂停从未生效（刷脸一直在）
-          if 'SBUIBiometricEventMonitor' not in common_m:
-              print("❌ DLCommon.m 没有尝试 SBUIBiometricEventMonitor（iOS 16 的真实入口）")
+          # (e2) ⭐⭐⭐ v0.2.2：守护循环在**贴纸模式下绝不能追「最高的其它窗口」**！
+          #   血泪（v0.2.1 真机日志）：
+          #       ★★ [锁屏贴纸] 锁屏窗口层级=1050 → 假空间层级=1051   ← 正确
+          #       [守护] 第 0 次：被更高窗口压住（当前 1051 < 需要 10001011）→ 抬升层级
+          #   `10001011` 来自无关浮窗 SGPanelWindow。一追就跳到 1000 万级，
+          #   **直接越过锁屏和桌面** → 贴纸形态当场被推翻 → 必然刷脸。
+          #   正确：贴纸模式比较基准 = **锁屏窗口**（lockLevel+1），只保证不被锁屏压住。
+          if '贴纸被锁屏反超' not in ctl:
+              print("❌ 守护循环缺少「贴纸被锁屏反超」分支")
+              print("   → 贴纸模式仍在追最高窗口，会被无关浮窗（SGPanelWindow）牵着")
+              print("     跳到 1000 万级、毁掉贴纸形态")
               sys.exit(1)
-          if '_setMatchingEnabled:' not in common_m:
-              print("❌ 没有试私有方法 _setMatchingEnabled:（iOS 16 实测名字）")
+          if not re.search(r'DLPinnedToLockScreen\(\)\s*\)\s*\{', ctl_nc):
+              print("❌ 守护循环没有用 DLPinnedToLockScreen() 分流层级策略")
               sys.exit(1)
-          if '所有候选路径都没命中' not in common_m:
-              print("❌ 缺少「全部路径未命中」的明确日志（这行是下一轮排查的唯一依据）")
+          # ⚠️ 必须从分支**开头**截（`if (DLPinnedToLockScreen()) {`），不能从日志行截：
+          #    注入测试证明「从日志行截」会漏掉日志之前的代码（把 need 改成
+          #    DLMaxOtherWindowLevel()+1000 正好写在日志之前 → 假绿）。
+          _m = re.search(r'DLPinnedToLockScreen\(\)\s*\)\s*\{(.*?)\}\s*else\s*\{', ctl_nc, re.S)
+          if _m and 'DLMaxOtherWindowLevel' in _m.group(1):
+              print("❌ 贴纸分支里出现 DLMaxOtherWindowLevel() → 又会被无关浮窗牵着走")
+              sys.exit(1)
+
+          # (f) ⭐⭐⭐ v0.2.2：Face ID 停用必须是「运行时侦查」，不再钉死类名/方法名
+          #   （钉死已连续失败两轮，且断言会被注释里的字面串骗成假绿）
+          if 'objc_getClassList' not in re.sub(r'//[^\n]*', '', common_m):
+              print("❌ DLCommon.m 没有运行时侦查（objc_getClassList）→ 又退回手写清单")
+              sys.exit(1)
+          if '无法干预生物识别' not in common_m:
+              print("❌ 缺少「侦查未找到可用 setter」的明确日志（下一轮排查的唯一依据）")
               sys.exit(1)
 
           print("✅ 「锁屏贴纸」形态完整（锁屏层级 + 锁屏 scene + 3 处吞掉解锁 + 退出出口）")
-          print("✅ 锁屏探测=精确类名 + key window 优先；Face ID=SBUIBiometricEventMonitor/_setMatchingEnabled:")
+          print("✅ 锁屏探测=精确类名 + key window 优先")
+          print("✅ 守护循环=贴纸模式只对齐锁屏；Face ID=运行时侦查式停用")
           PY
 
           echo "--- 检查 20：⭐⭐ 版本号只能有一个来源（禁止在日志/横幅里硬编码）---"

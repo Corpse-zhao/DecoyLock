@@ -14,7 +14,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#define DL_VERSION      @"0.2.1"
+#define DL_VERSION      @"0.2.2"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 
 // 共享配置目录（SpringBoard 进程与「设置」进程都能写的位置）

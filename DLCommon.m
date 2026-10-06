@@ -237,23 +237,72 @@ static BOOL sBioWasMatchingValid = NO;
 
 BOOL DLBiometricMatchingIsOff(void) { return sBioMatchingOff; }
 
-// ⭐⭐⭐ v0.2.1 重做：Face ID 临时停用（多路径探测）
+// ⭐⭐⭐ v0.2.2 重做：Face ID 临时停用（**运行时自动侦查**，不再手写候选清单）
 //
 // 🔥 v0.2.0 血泪：只试了 `SBUIBiometricResource -setMatchingEnabled:` 一条路，
 //    真机日志一路 `实例不支持 setMatchingEnabled: → 跳过（不干预）`
 //    → **暂停从未生效过**，刷脸自然一直在（v0.1.22/v0.1.23 的努力全白费）。
 //
-// iOS 16 实测正确的入口是 **`SBUIBiometricEventMonitor`**（不是 BiometricResource），
-// 方法名是私有的 **`_setMatchingEnabled:`**（带下划线）。
-// 为兼容性，这里按优先级**依次尝试**，并**把命中的路径打进日志** ——
-// 这样即使某个类名在这台机器上不存在，下一次日志也能告诉我们真实情况。
+// 🔥🔥 v0.2.1 血泪：我改成手写「2 个类 × 3 个方法名」的候选清单，
+//    真机日志：`⚠️ 所有候选路径都没命中（类=SBUIBiometricEventMonitor,
+//    SBUIBiometricResource；方法=_setMatchingEnabled:,setMatchingEnabled:,
+//    setMatchingEnabledForFaceID:）→ 无法干预生物识别`
+//    → **手写清单 = 我在猜**；猜错了就永远命不中，而且下一轮还得继续猜。
 //
-// 参考：theapplewiki.com Dev:BiometricKit.framework
-//   monitor = [objc_getClass("SBUIBiometricEventMonitor") sharedInstance];
-//   _wasMatching = [[monitor valueForKey:@"_matchingEnabled"] boolValue];
-//   [monitor _setMatchingEnabled:NO];   // 停：不再发起匹配
+// 🔥🔥🔥 v0.2.2 正解：**让运行时自己告诉我有哪些类、哪些方法**，然后按语义挑。
+//    ① objc_getClassList 枚举所有已注册类，筛类名含 "Biometric" 的；
+//    ② 在它们身上取 sharedInstance / manager / delegate 等实例；
+//    ③ 沿**继承链**找「名字含 Matching/Enabled/Match 且以 : 结尾」的实例方法（setter）；
+//    ④ 逐个 respondsToSelector 后调用；
+//    ⑤ **把侦查结果写进日志** —— 无论成功失败，下一轮都不用再猜。
+//
+// 已知线索（theapplewiki.com Dev:BiometricKit.framework）：
+//   manager = [objc_getClass("BiometricKit") manager];
+//   SBUIBiometricEventMonitor *m = manager.delegate;   // ← 匹配开关在它身上
+//   [m _setMatchingEnabled:NO];                        // 停：不再发起匹配
+//   侦查逻辑天然覆盖这条路径（"BiometricKit" 含 "Biometric"；delegate 会被展开）。
 //
 // ⚠️ 依旧全程 respondsToSelector 显式探测 —— 不存在的类/方法直接 msgSend 是崩溃级风险。
+
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐ v0.2.2：运行时侦查的「实例解析」统一入口
+//
+// 给定 (类名, 实例类名)，返回**候选实例列表**（含单例本身 + 其 delegate）。
+// 侦查阶段和调用阶段**共用这一个函数** —— 这是刻意的：
+//   如果两边各解析一次，就可能「侦查时看到 setter，调用时却拿不到那个对象」，
+//   出现「日志说找到了却没调成」的鬼故事。共用 = 两边必然一致。
+// ---------------------------------------------------------------------------
+static NSArray<id> *DLBioInstancesFor(NSString *ownerClassName, NSString *instClassName) {
+    Class c = objc_getClass(ownerClassName.UTF8String);
+    if (!c) return @[];
+
+    NSMutableArray<id> *insts = [NSMutableArray array];
+    for (NSString *sing in @[@"sharedInstance", @"manager", @"sharedManager",
+                             @"sharedConnection"]) {
+        SEL s = NSSelectorFromString(sing);
+        if (![c respondsToSelector:s]) continue;
+        id v = ((id (*)(id, SEL))objc_msgSend)(c, s);
+        if (v) [insts addObject:v];
+    }
+    // delegate 也要看（BiometricKit.manager.delegate == SBUIBiometricEventMonitor）
+    for (id inst in [insts copy]) {
+        SEL dsel = NSSelectorFromString(@"delegate");
+        if (![inst respondsToSelector:dsel]) continue;
+        id d = ((id (*)(id, SEL))objc_msgSend)(inst, dsel);
+        if (d) [insts addObject:d];
+    }
+
+    // 若给了期望的实例类名，把匹配的排到前面（优先在「当初发现 setter 的那个类」上调用）
+    if (instClassName.length) {
+        [insts sortUsingComparator:^NSComparisonResult(id a, id b) {
+            BOOL ma = [NSStringFromClass([a class]) isEqualToString:instClassName];
+            BOOL mb = [NSStringFromClass([b class]) isEqualToString:instClassName];
+            if (ma == mb) return NSOrderedSame;
+            return ma ? NSOrderedAscending : NSOrderedDescending;
+        }];
+    }
+    return insts;
+}
 
 void DLSetBiometricMatching(BOOL enabled) {
     // ⭐ 幂等短路：状态没变直接返回（不重复调系统 API，避免匹配抖动）
@@ -263,64 +312,133 @@ void DLSetBiometricMatching(BOOL enabled) {
     BOOL want = enabled;                       // 目标状态
     BOOL wantOff = !enabled;
 
-    // 方法名候选（私有 API，不同版本名字不同，依次试）
-    NSArray<NSString *> *setterNames = @[
-        @"_setMatchingEnabled:",               // ⭐ iOS 16 实测（带下划线）
-        @"setMatchingEnabled:",                // 旧版 / 部分版本
-        @"setMatchingEnabledForFaceID:",
-    ];
+    // ⭐⭐⭐ v0.2.2：**不再手写候选清单**，改为「运行时自动侦查」。
+    //
+    // 血泪：v0.2.1 我手写了 2 个类 × 3 个方法名，真机日志说「所有候选路径都没命中」。
+    //   手写清单 = 我在猜；猜错了就永远命不中，而且下一轮还得继续猜。
+    //   正解 = **让运行时自己告诉我有哪些类、哪些方法**，然后按语义挑。
+    //
+    // 做法：
+    //   ① 枚举所有已注册类，筛出类名含 "Biometric" 的（BiometricKit / SBUIBiometric* 等）；
+    //   ② 取 sharedInstance / manager 之类的单例；
+    //   ③ 在该单例及其 delegate 上，找出所有「名字里含 Matching/Enabled 且以 : 结尾」的方法；
+    //   ④ 直接调它。
+    //   ⑤ 把**侦查到的东西**写进日志 —— 无论成功失败，下一轮都不用再猜。
+    static NSMutableArray<NSString *> *sBioSetters = nil;   // 命中的 (类名, 选择器) 组合
+    static BOOL sBioReconDone = NO;
 
-    // 类候选（按可靠性排序）
-    NSArray<NSString *> *classNames = @[
-        @"SBUIBiometricEventMonitor",          // ⭐ iOS 16 实测入口
-        @"SBUIBiometricResource",
-    ];
+    if (!sBioReconDone) {
+        sBioReconDone = YES;
+        sBioSetters = [NSMutableArray array];
 
-    // 每次调用前，先把「当前匹配状态」记下来，便于恢复时对照
-    for (NSString *cn in classNames) {
-        Class cls = objc_getClass(cn.UTF8String);
-        if (!cls) continue;
+        int cnt = objc_getClassList(NULL, 0);
+        if (cnt > 0) {
+            Class *all = (Class *)malloc(sizeof(Class) * (size_t)cnt);
+            if (all) {
+                cnt = objc_getClassList(all, cnt);
+                NSMutableArray<NSString *> *seen = [NSMutableArray array];
+                for (int i = 0; i < cnt; i++) {
+                    Class c = all[i];
+                    if (!c) continue;
+                    const char *nm = class_getName(c);
+                    if (!nm) continue;
+                    NSString *cn = @(nm);
+                    if ([cn rangeOfString:@"Biometric"].location == NSNotFound &&
+                        [cn rangeOfString:@"biometric"].location == NSNotFound) continue;
+                    [seen addObject:cn];
+                }
+                free(all);
+                if (seen.count) {
+                    DLProbe(@"[FaceID][侦查] 运行时含 Biometric 的类（%lu 个）：%@",
+                            (unsigned long)seen.count,
+                            [seen componentsJoinedByString:@", "]);
+                } else {
+                    DLProbe(@"[FaceID][侦查] 运行时**没有**任何类名含 Biometric —— "
+                            @"说明匹配能力在别的框架（可能要查 BiometricKit 的 C 接口）");
+                }
 
-        id inst = nil;
-        if ([cls respondsToSelector:@selector(sharedInstance)]) {
-            inst = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstance));
-        }
-        if (!inst) continue;
+                // 对每个候选类：取单例 → 找 setter 方法（含 Matching/Enabled）
+                for (NSString *cn in seen) {
+                    Class c = objc_getClass(cn.UTF8String);
+                    if (!c) continue;
 
-        // 命中前先把「原状态」读出来（仅首次），供恢复时兜底
-        if (sBioWasMatchingValid == NO &&
-            [inst respondsToSelector:NSSelectorFromString(@"_matchingEnabled")]) {
-            id v = ((id (*)(id, SEL))objc_msgSend)(inst, NSSelectorFromString(@"_matchingEnabled"));
-            if ([v respondsToSelector:@selector(boolValue)]) {
-                sBioWasMatching = [v boolValue];
-                sBioWasMatchingValid = YES;
+                    NSArray<id> *insts = DLBioInstancesFor(cn, nil);
+
+                    for (id inst in insts) {
+                        // ⚠️ 两台机器上都踩过的坑：
+                        //   ① 这里**不能**用 object_getClass(inst) —— 那拿到的是**元类**，
+                        //      名字会打印成 "XXXMeta"，且 class_copyMethodList(元类) 列出的是
+                        //      **类方法**，而我们要找的 setter 全是**实例方法** → 一条都找不到。
+                        //      正解 = 用 [inst class]（实例的真实类）。
+                        //   ② **必须沿继承链往上走** —— setter 常常定义在父类/基类上
+                        //      （例如 _setMatchingEnabled: 在某个基类 monitor 里），
+                        //      只在自身类里找会漏。
+                        Class icls = [inst class];
+                        NSMutableArray<NSString *> *hits = [NSMutableArray array];
+                        for (Class walk = icls; walk && walk != [NSObject class];
+                             walk = class_getSuperclass(walk)) {
+                            unsigned int mc = 0;
+                            Method *mlist = class_copyMethodList(walk, &mc);
+                            for (unsigned int k = 0; mlist && k < mc; k++) {
+                                NSString *sn = NSStringFromSelector(method_getName(mlist[k]));
+                                if (!sn.length) continue;
+                                if (![sn hasSuffix:@":"]) continue;         // 要带参数（setter）
+                                if ([sn rangeOfString:@"Matching"].location == NSNotFound &&
+                                    [sn rangeOfString:@"Enabled"].location == NSNotFound &&
+                                    [sn rangeOfString:@"Match"].location == NSNotFound) continue;
+                                if (![hits containsObject:sn]) [hits addObject:sn];
+                            }
+                            if (mlist) free(mlist);
+                        }
+                        if (hits.count) {
+                            DLProbe(@"[FaceID][侦查] %@ (%@) 的匹配相关 setter：%@",
+                                    cn, NSStringFromClass(icls),
+                                    [hits componentsJoinedByString:@", "]);
+                            for (NSString *sn in hits) {
+                                [sBioSetters addObject:[NSString stringWithFormat:@"%@|%@|%@",
+                                                        cn,
+                                                        NSStringFromClass(icls),
+                                                        sn]];
+                            }
+                        }
+                    }
+                }
+                DLProbe(@"[FaceID][侦查] 共找到 %lu 条候选 setter 路径",
+                        (unsigned long)sBioSetters.count);
             }
         }
+    }
 
-        for (NSString *sn in setterNames) {
-            SEL sel = NSSelectorFromString(sn);
-            if (!sel || ![inst respondsToSelector:sel]) continue;
+    // ---- 用侦查到的候选路径去调 ----
+    if (!sBioSetters.count) {
+        DLProbe(@"[FaceID] ⚠️ 侦查未找到任何可用的匹配 setter → 无法干预生物识别"
+                @"（这行说明：本机的匹配开关不在 Objective-C 层，或类名完全不同）");
+        return;
+    }
 
+    for (NSString *entry in sBioSetters) {
+        NSArray<NSString *> *parts = [entry componentsSeparatedByString:@"|"];
+        if (parts.count < 3) continue;
+        SEL sel = NSSelectorFromString(parts[2]);
+        if (!sel) continue;
+
+        // ⭐ 用**同一个**实例解析函数，保证「侦查时看到的东西」和「调用时拿到的对象」
+        //    是同一批（否则会出现「日志说找到了 setter，却没调成」的鬼故事）。
+        for (id inst in DLBioInstancesFor(parts[0], parts[1])) {
+            if (![inst respondsToSelector:sel]) continue;
             ((void (*)(id, SEL, BOOL))objc_msgSend)(inst, sel, want);
-            sBioMatchingOff = wantOff;     // ⚠️ 只有真正调用成功后才改状态
-            DLProbe(@"[FaceID] 已%@生物识别匹配（%@）→ 命中路径 %@ -%@",
+            sBioMatchingOff = wantOff;
+            DLProbe(@"[FaceID] 已%@生物识别匹配（%@）→ 命中路径 %@ (%@) -%@",
                     enabled ? @"恢复" : @"暂停",
                     enabled ? @"退出假空间" : @"假空间展示期间",
-                    cn, sn);
-
-            // ⭐ 恢复时再校一次：若系统原状态本就是「不匹配」，
-            //    说明这次恢复是多余的，记一行日志便于排查抖动。
-            if (enabled && sBioWasMatchingValid && !sBioWasMatching) {
-                DLProbe(@"[FaceID] 提示：干预前系统本就未在匹配（已按原值恢复）");
-            }
+                    parts[0], parts[1], parts[2]);
             return;
         }
     }
 
-    // 全部路径都没命中 → 明确记日志（这条日志是下一轮的诊断依据）
-    DLProbe(@"[FaceID] ⚠️ 所有候选路径都没命中（类=%@；方法=%@）→ 无法干预生物识别",
-            [classNames componentsJoinedByString:@","],
-            [setterNames componentsJoinedByString:@","]);
+    DLProbe(@"[FaceID] ⚠️ 侦查到 %lu 条候选，但**全部调用失败**"
+            @"（说明方法存在但调用无效，可能需先停下某个 monitor）",
+            (unsigned long)sBioSetters.count);
 }
 
 // ---------------------------------------------------------------------------

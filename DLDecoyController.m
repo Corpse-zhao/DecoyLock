@@ -354,12 +354,37 @@ static UIWindowScene *DLSceneOwningLockScreen(void);
         // ⭐ v0.1.17：可见时也顺便检查层级 —— 系统可能在我们之后又拉了一个
         //    更高的窗口（例如锁屏重建），把我们压到下面去（用户就会看到
         //    「密码错误/刷脸」而不是假空间）。发现被压就立刻抬上去。
-        CGFloat want = DLMaxOtherWindowLevel() + 1000.0;
-        if (want < 100000.0) want = 100000.0;
-        if (sWindow.windowLevel < want) {
-            DLProbe(@"[守护] 第 %ld 次：被更高窗口压住（当前 %.0f < 需要 %.0f）→ 抬升层级",
-                    (long)n, sWindow.windowLevel, want);
-            sWindow.windowLevel = want;
+        //
+        // 🔥🔥🔥 v0.2.2 重大修正：**贴纸模式下绝不能被无关浮窗牵着走**！
+        //    v0.2.1 真机日志（致命）：
+        //        ★★ [锁屏贴纸] 锁屏窗口层级=1050 → 假空间层级=1051   ← 正确
+        //        [守护] 第 0 次：被更高窗口压住（当前 1051 < 需要 10001011）→ 抬升层级
+        //    这里 `10001011` 来自 `SGPanelWindow`（一个无关的浮窗/录制悬浮球）。
+        //    旧逻辑无条件追「最高的其它窗口」，一追就跳到 10000011 ——
+        //    **直接越过锁屏和桌面**，等于把「贴在锁屏之上」的形态当场推翻，
+        //    又变回「盖在真桌面之上」→ 必然刷脸。
+        //
+        //    正确做法：贴纸模式下我们的**比较基准是锁屏窗口**，不是所有窗口。
+        //      只要我们还压着锁屏（level > 锁屏层级）就够了；
+        //      至于别的浮窗压在我们上面 —— 那是它的事，与我们无关，**不要追**。
+        if (DLPinnedToLockScreen()) {
+            CGFloat lockLevel = DLLockScreenWindowLevel();
+            CGFloat need = (lockLevel > 0.0) ? (lockLevel + 1.0) : 0.0;
+            if (need > 0.0 && sWindow.windowLevel < need) {
+                DLProbe(@"[守护] 第 %ld 次：贴纸被锁屏反超（当前 %.0f < 需 %.0f）→ 只抬回锁屏之上",
+                        (long)n, sWindow.windowLevel, need);
+                sWindow.windowLevel = need;     // ⚠️ 只抬到「锁屏+1」，绝不越到桌面之上
+            }
+            // 注意：这里**没有** else 分支去追「最高窗口」—— 那正是要避免的行为。
+        } else {
+            // 非贴纸模式（旧形态兜底）→ 才沿用「追最高窗口」的老逻辑。
+            CGFloat want = DLMaxOtherWindowLevel() + 1000.0;
+            if (want < 100000.0) want = 100000.0;
+            if (sWindow.windowLevel < want) {
+                DLProbe(@"[守护] 第 %ld 次：被更高窗口压住（当前 %.0f < 需要 %.0f）→ 抬升层级",
+                        (long)n, sWindow.windowLevel, want);
+                sWindow.windowLevel = want;
+            }
         }
     }
     if (n + 1 < 30) {
