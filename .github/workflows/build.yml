@@ -347,11 +347,19 @@ jobs:
           ctl_nc = re.sub(r'//[^\n]*', '', ctl)
 
           # (c) 实现层的安全保护
-          if 'SBUIBiometricResource' not in common_m:
-              print("❌ DLCommon.m 里找不到 SBUIBiometricResource（Face ID 暂停未实现）")
+          #   ⭐ v0.2.1：不再钉死某个类/方法名 —— v0.2.0 钉死 SBUIBiometricResource
+          #   + setMatchingEnabled: 本身就是错的（真机没有这个方法名，iOS 16 要
+          #   SBUIBiometricEventMonitor -_setMatchingEnabled:）。
+          #   改为断言「多路径探测 + 每条路径逐一 respondsToSelector 保护」这个结构。
+          if 'SBUIBiometricEventMonitor' not in common_m:
+              print("❌ DLCommon.m 找不到 SBUIBiometricEventMonitor")
+              print("   → iOS 16 上只有它（-_setMatchingEnabled:）能真正停掉 Face ID 匹配")
               sys.exit(1)
-          if 'respondsToSelector:@selector(setMatchingEnabled:)' not in common_m:
-              print("❌ DLCommon.m 未对 setMatchingEnabled: 做 respondsToSelector 保护")
+          if 'SBUIBiometricResource' not in common_m:
+              print("❌ DLCommon.m 找不到 SBUIBiometricResource（旧版本兼容路径缺失）")
+              sys.exit(1)
+          if not re.search(r'respondsToSelector:\s*sel\]', common_m):
+              print("❌ DLCommon.m 未对候选 setter 逐个做 respondsToSelector:sel 保护")
               print("   → 不同 iOS 版本可能没有这个方法，直接调会崩进程")
               sys.exit(1)
           if 'DL_VERSION' not in common_h or 'DLBiometricMatchingIsOff' not in common_h:
@@ -508,7 +516,94 @@ jobs:
               print("❌ DLDecoyController.m 拆除路径里没有调用 DLUnpinFromLockScreen()")
               sys.exit(1)
 
+          # (e) ⭐⭐⭐ v0.2.1：锁屏窗口类名必须**精确匹配**，绝不能子串匹配！
+          #   血泪：v0.2.0 用 rangeOfString 子串匹配 + 类名表里含 "CoverSheetView"，
+          #   结果 `_SBWallpaperSecureWindow`（含 "CoverSheet"）被误命中为锁屏窗口（level 1035），
+          #   真锁屏 `SBCoverSheetWindow`（level 1050, key=1）被漏掉
+          #   → 假空间 1036 贴在锁屏**下面**，scene 探测也失败。
+          ctl_nc = re.sub(r'//[^\n]*', '', ctl)
+          if re.search(r'rangeOfString:want\]\.location\s*!=\s*NSNotFound', ctl_nc):
+              print("❌ 锁屏窗口类名又用了子串匹配（rangeOfString）")
+              print("   → _SBWallpaperSecureWindow 会因含 'CoverSheet' 被误认成锁屏")
+              sys.exit(1)
+          if ctl_nc.count('[cls isEqualToString:want]') < 2:
+              print("❌ 锁屏窗口/锁屏 scene 探测没有都用精确类名匹配（isEqualToString:want]）")
+              sys.exit(1)
+          # 必须优先采信 key window（系统自己选的交互窗口，比猜类名可靠）
+          if 'key window 就是锁屏' not in ctl:
+              print("❌ DLLockScreenWindowLevel 没有「优先采信 key window」的分支")
+              sys.exit(1)
+
+          # (f) ⭐⭐⭐ v0.2.1：Face ID 必须走 iOS 16 真实入口
+          #   `SBUIBiometricEventMonitor -_setMatchingEnabled:`
+          #   血泪：v0.2.0 只试 SBUIBiometricResource + setMatchingEnabled:
+          #   → 真机日志一路「实例不支持 setMatchingEnabled:」→ 暂停从未生效（刷脸一直在）
+          if 'SBUIBiometricEventMonitor' not in common_m:
+              print("❌ DLCommon.m 没有尝试 SBUIBiometricEventMonitor（iOS 16 的真实入口）")
+              sys.exit(1)
+          if '_setMatchingEnabled:' not in common_m:
+              print("❌ 没有试私有方法 _setMatchingEnabled:（iOS 16 实测名字）")
+              sys.exit(1)
+          if '所有候选路径都没命中' not in common_m:
+              print("❌ 缺少「全部路径未命中」的明确日志（这行是下一轮排查的唯一依据）")
+              sys.exit(1)
+
           print("✅ 「锁屏贴纸」形态完整（锁屏层级 + 锁屏 scene + 3 处吞掉解锁 + 退出出口）")
+          print("✅ 锁屏探测=精确类名 + key window 优先；Face ID=SBUIBiometricEventMonitor/_setMatchingEnabled:")
+          PY
+
+          echo "--- 检查 20：⭐⭐ 版本号只能有一个来源（禁止在日志/横幅里硬编码）---"
+          # v0.2.1 血泪：启动横幅里硬编码了 "Tweak.x v0.2.0"，升级时漏改，
+          #   导致日志同时出现两个版本号 → 排查时误判「版本不一致 → 插件没生效」。
+          # 规则：DL_VERSION 是唯一来源；任何打印出来的版本号都必须来自它。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          ver = None
+          hv = io.open('DLCommon.h', encoding='utf-8', errors='replace').read()
+          m = re.search(r'#define\s+DL_VERSION\s+@"([^"]+)"', hv)
+          if not m:
+              print("❌ DLCommon.h 里找不到 DL_VERSION 定义")
+              sys.exit(1)
+          ver = m.group(1)
+          print("   DL_VERSION = %s" % ver)
+
+          bad = 0
+          # 扫描会「打印/显示给用户」的代码：日志文案 + plist 页脚 + prefs 版本常量
+          files = ['Tweak.x', 'DLCommon.m', 'DLDecoyController.m',
+                   'prefs/DLRootListController.m',
+                   'prefs/Resources/Root.plist',
+                   'prefs/Resources/Info.plist']
+          # 形如 v0.2.0 / 0.2.0 的字面版本号（排除注释行与纯粹的版本历史注释）
+          litver = re.compile(r'\b\d+\.\d+\.\d+\b')
+          for fn in files:
+              try:
+                  txt = io.open(fn, encoding='utf-8', errors='replace').read()
+              except IOError:
+                  continue
+              for i, line in enumerate(txt.split('\n'), 1):
+                  s = line.strip()
+                  if s.startswith('//') or s.startswith('#'):
+                      continue
+                  # 只看「运行时会输出/展示」的行
+                  if not re.search(r'DLProbe\(|footerText|CFBundle(Short)?Version|kDLPrefsVersion', line):
+                      continue
+                  for found in litver.findall(line):
+                      if found == ver:
+                          continue
+                      print("❌ %s:%d 里出现与 DL_VERSION(%s) 不一致的硬编码版本号 %s"
+                            % (fn, i, ver, found))
+                      print("   → 这会让日志/面板出现两个版本号，排查时误判「插件没生效」")
+                      bad += 1
+          if bad:
+              sys.exit(1)
+
+          # Tweak.x 的启动横幅必须用 %@ + DL_VERSION，不能写死
+          twk = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          if 'DecoyLock %@ 启动' not in twk:
+              print("❌ 启动横幅没有用 'DecoyLock %@ 启动' + DL_VERSION 的形式")
+              sys.exit(1)
+          print("✅ 版本号单一来源（DL_VERSION），日志/面板无硬编码残留")
           PY
 
           if [ "$FAIL" -ne 0 ]; then

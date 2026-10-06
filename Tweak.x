@@ -1273,7 +1273,10 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.2.0 不解锁真机进入假空间（锁屏贴纸））==========", DL_VERSION);
+    // ⚠️ v0.2.1：这里**只能**用 DL_VERSION，不要再手写版本号！
+    //    旧版这里硬编码了 "Tweak.x v0.2.0" —— 升级到 0.2.1 时忘了改它，
+    //    结果日志里同时出现两个版本号，排查时极易误判。
+    DLProbe(@"========== DecoyLock %@ 启动（锁屏贴纸·不解锁真机）==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);

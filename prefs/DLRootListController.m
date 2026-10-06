@@ -30,7 +30,7 @@ static NSString *const kDLDomain = @"com.blr.decoylock";
 //       拿不到 DLCommon.h 里的 DL_VERSION。
 //    诊断页会拿它跟「插件启动横幅」里的版本对比，
 //    一眼看出 SpringBoard 里跑的到底是不是新版。
-static NSString *const kDLPrefsVersion = @"0.2.0";
+static NSString *const kDLPrefsVersion = @"0.2.1";
 
 // ---------------------------------------------------------------------------
 // 配置读写（共享目录 + NSUserDefaults，SpringBoard 侧可读）
@@ -414,9 +414,24 @@ static void DLDoRespring(void) {
         //    旧代码从文件**开头**找第一条就 break —— 那是最旧的那条，
         //    设备重启/重启桌面几次之后就会报出一个**过期的版本号**，
         //    反而把人误导成「版本一致」。必须**从后往前**取最新一条。
-        NSArray<NSString *> *allLines = [raw componentsSeparatedByString:@"\n"];
+        // ⚠️ v0.2.1 重要修正：**不要再无条件喊「插件没生效」**。
+        //
+        // 🔥 v0.2.0 血泪：旧逻辑只要 runningVer != kDLPrefsVersion 就报
+        //   「⚠️⚠️ 版本不一致 —— 插件没生效的直接原因」。
+        //   但真机上「面板版本 ≠ 插件版本」有**两种完全不同的原因**：
+        //     ① 插件 dylib 没被加载（严重）→ 横幅是**旧版**，功能确实没生效；
+        //     ② 只是 **prefs 面板没跟着更新**（无害）→ dylib 已是新版，
+        //        横幅显示新版，只是设置页 bundle 还停在旧版。
+        //   ②这种情况旧代码也会大喊「插件没生效」，把用户往 respring 上带，
+        //   实际 respring 一百次也没用（面板是 App 层的东西，跟 SpringBoard 无关）。
+        //
+        //   现在改为：**用横幅判定作者意图**。
+        //     - 横幅版本 == 面板版本        → 一致 ✅
+        //     - 横幅版本 比 面板版本 新      → 面板旧（无害），明说，不建议 respring
+        //     - 横幅是"未检测到"/比面板旧    → 才是真的「dylib 没加载」，才建议 respring
         NSString *runningVer = @"(未检测到)";
         NSInteger bannerCount = 0;
+        NSArray<NSString *> *allLines = [raw componentsSeparatedByString:@"\n"];
         for (NSInteger i = (NSInteger)allLines.count - 1; i >= 0; i--) {
             NSString *ln = allLines[(NSUInteger)i];
             if ([ln rangeOfString:@"DecoyLock"].location == NSNotFound) continue;
@@ -433,21 +448,37 @@ static void DLDoRespring(void) {
                 : [tail substringToIndex:sp.location];
         }
 
-        BOOL same = [runningVer isEqualToString:kDLPrefsVersion];
-        if (same) {
+        if (runningVer.length == 0 || [runningVer isEqualToString:@"(未检测到)"]) {
+            // 真的没横幅 = dylib 根本没加载（或被清过日志）
+            [lines addObject:@"❌ 插件未运行 —— 日志里找不到任何启动横幅"];
+            [lines addObject:@"  → 说明 DecoyLock.dylib 没被加载（不是版本问题）。"];
+            [lines addObject:@"  → 修法：确认已安装 + 重启桌面；仍无效则看是否被安全模式排除。"];
+        } else if ([runningVer isEqualToString:kDLPrefsVersion]) {
             [lines addObject:[NSString stringWithFormat:
                 @"版本: 面板 %@ ／ 插件 %@ ✅ 一致（启动横幅 %ld 条，取最新）",
                 kDLPrefsVersion, runningVer, (long)bannerCount]];
         } else {
-            [lines addObject:@"⚠️⚠️ 版本不一致 —— 插件没生效的直接原因 ⚠️⚠️"];
-            [lines addObject:[NSString stringWithFormat:
-                @"  面板版本 = %@（设置页是新版）", kDLPrefsVersion]];
-            [lines addObject:[NSString stringWithFormat:
-                @"  插件版本 = %@（SpringBoard 里跑的，取最新横幅）", runningVer]];
-            [lines addObject:[NSString stringWithFormat:
-                @"  启动横幅共 %ld 条", (long)bannerCount]];
-            [lines addObject:@"  → 说明装了新版但 SpringBoard 还在跑旧代码。"];
-            [lines addObject:@"  → 修法：点上面「重启桌面生效」，或手动 respring。"];
+            // 版本不同 → 判断谁更新（用数值比较，避免字符串比较踩坑）
+            NSComparisonResult cmp = [runningVer compare:kDLPrefsVersion
+                                                 options:NSNumericSearch];
+            if (cmp == NSOrderedDescending) {
+                // 插件比面板新 → 面板没跟上（无害）
+                [lines addObject:[NSString stringWithFormat:
+                    @"版本: 插件 %@ ＞ 面板 %@（面板未更新，**不影响功能**）",
+                    runningVer, kDLPrefsVersion]];
+                [lines addObject:@"  ✅ 插件本体已在运行新版 —— 功能是新的，不用重启桌面。"];
+                [lines addObject:@"  ℹ️ 只是设置页面板还是旧版（重装一次 deb 即可刷新）。"];
+            } else {
+                // 插件比面板旧 / 无法比较 → 这才是「装了新版但 SpringBoard 跑旧代码」
+                [lines addObject:@"⚠️ 插件版本落后于面板 —— 可能没重启桌面"];
+                [lines addObject:[NSString stringWithFormat:
+                    @"  面板版本 = %@（设置页）", kDLPrefsVersion]];
+                [lines addObject:[NSString stringWithFormat:
+                    @"  插件版本 = %@（SpringBoard 里跑的，取最新横幅）", runningVer]];
+                [lines addObject:[NSString stringWithFormat:
+                    @"  启动横幅共 %ld 条", (long)bannerCount]];
+                [lines addObject:@"  → 修法：点上面「重启桌面生效」，或手动 respring。"];
+            }
         }
         [lines addObject:@""];
     }

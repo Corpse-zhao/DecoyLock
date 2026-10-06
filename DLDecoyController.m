@@ -475,44 +475,74 @@ static CGFloat DLMaxOtherWindowLevelVerbose(BOOL verbose) {
 // ---------------------------------------------------------------------------
 
 // 锁屏窗口的类名（按优先级：越靠前越「就是锁屏本身」）
+// ⭐⭐⭐ v0.2.1 修正：只保留**精确类名**，并删掉模糊项。
+//
+// 🔥 v0.2.0 血泪：这里原来有一项 @"CoverSheetView"，而判定用的是
+//    [cls rangeOfString:want] **子串匹配** —— 于是
+//    `_SBWallpaperSecureWindow` 因为类名里含 "CoverSheet" 被**误命中**为锁屏窗口！
+//    真机日志铁证（窗口清单）：
+//        _SBWallpaperSecureWindow level=1035 hidden=0        ← 被误认成锁屏
+//        SBCoverSheetWindow       level=1050 hidden=0 key=1  ← 真锁屏，被漏掉
+//    → 算出 1035+1=1036，假空间贴在锁屏**下面**，同时 scene 探测也失败。
+//    教训：类名匹配**永远用精确相等**，不要用子串 —— 系统类名前缀高度雷同。
 static NSArray<NSString *> *DLLockScreenClassNames(void) {
     return @[
+        @"SBCoverSheetWindow",              // ⭐ iOS 14+ 真·锁屏窗口（实测 level 1050, key=1）
         @"CSCoverSheetView",
         @"SBLockScreenView",
         @"SBFLockScreenDateView",
-        @"CSCombinedListViewController",
-        @"CoverSheetView",
     ];
 }
 
-// 返回锁屏窗口的层级；探测不到返回 0
+// ⭐ v0.2.1：真·锁屏窗口层级。
+//   与 v0.2.0 的两处关键区别：
+//     ① 类名匹配改**精确相等**（见上）；
+//     ② **优先采信 key window** —— 真机实测锁屏期间 key window 就是
+//        `SBCoverSheetWindow`(level 1050)，这是系统自己选的「当前交互窗口」，
+//        比按类名猜可靠得多。类名匹配降为兜底。
 static CGFloat DLLockScreenWindowLevel(void) {
     CGFloat found = 0.0;
+
+    // ---- ① 首选：当前 key window 是锁屏类 → 直接采信 ----
+    UIWindow *key = nil;
+    for (UIWindow *w in DLAllWindows()) {
+        if (w && w != sWindow && !w.hidden && w.isKeyWindow) { key = w; break; }
+    }
+    if (key) {
+        NSString *kcls = NSStringFromClass(object_getClass(key));
+        for (NSString *want in DLLockScreenClassNames()) {
+            if ([kcls isEqualToString:want]) {
+                DLProbe(@"[锁屏探测] key window 就是锁屏 %@ level=%.0f → 直接采信",
+                        kcls, key.windowLevel);
+                return key.windowLevel;
+            }
+        }
+    }
+
+    // ---- ② 兜底：按**精确类名**找（绝不子串匹配）----
     for (UIWindow *w in DLAllWindows()) {
         if (!w || w == sWindow) continue;
         NSString *cls = NSStringFromClass(object_getClass(w));
         for (NSString *want in DLLockScreenClassNames()) {
-            if ([cls isEqualToString:want] ||
-                [cls rangeOfString:want].location != NSNotFound) {
-                if (w.windowLevel > found) found = w.windowLevel;
-                DLProbe(@"[锁屏探测] 命中锁屏窗口 %@ level=%.0f hidden=%d",
-                        cls, w.windowLevel, (int)w.hidden);
+            if ([cls isEqualToString:want]) {          // ⭐ 精确相等
+                if (w.windowLevel > found) {
+                    found = w.windowLevel;
+                    DLProbe(@"[锁屏探测] 命中锁屏窗口 %@ level=%.0f hidden=%d key=%d",
+                            cls, w.windowLevel, (int)w.hidden, (int)w.isKeyWindow);
+                }
                 break;
             }
         }
-        // 兜底：类名不认识时，用「层级很高且正在显示的窗口」做近似判据。
-        // iOS 16 的锁屏层级通常在 3000~4000 区间（远低于网络锁/弹窗的 10000+）。
-        if (found <= 0.0 && !w.hidden && w.windowLevel >= 1000.0 && w.windowLevel <= 8000.0) {
-            if (w.windowLevel > found) found = w.windowLevel;
-        }
     }
     if (found <= 0.0) {
-        DLProbe(@"[锁屏探测] 未命中锁屏窗口（类名/层级判据都没中）");
+        DLProbe(@"[锁屏探测] 未命中锁屏窗口（精确类名都没中）");
     }
     return found;
 }
 
-// 找出「锁屏所在的那个 scene」—— 假空间必须挂在这里，才能与锁屏同层排序
+// 找出「锁屏所在的那个 scene」—— 假空间必须挂在这里，才能与锁屏同层排序。
+// ⚠️ v0.2.1：同样改成**精确类名**匹配；并优先用「容纳锁屏窗口的 scene」，
+//    比「key window 所在 scene」更稳（锁屏窗口本身就在锁屏 scene 里）。
 static UIWindowScene *DLSceneOwningLockScreen(void) {
     if (@available(iOS 13.0, *)) {
         for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -522,10 +552,9 @@ static UIWindowScene *DLSceneOwningLockScreen(void) {
                 if (!w || w == sWindow) continue;
                 NSString *cls = NSStringFromClass(object_getClass(w));
                 for (NSString *want in DLLockScreenClassNames()) {
-                    if ([cls isEqualToString:want] ||
-                        [cls rangeOfString:want].location != NSNotFound) {
-                        DLProbe(@"[锁屏探测] 锁屏所在 scene 已锁定（activation=%ld）",
-                                (long)ws.activationState);
+                    if ([cls isEqualToString:want]) {      // ⭐ 精确相等
+                        DLProbe(@"[锁屏探测] 锁屏所在 scene 已锁定（%@ level=%.0f activation=%ld）",
+                                cls, w.windowLevel, (long)ws.activationState);
                         return ws;
                     }
                 }
@@ -752,8 +781,7 @@ static void DLBioGuardTick(NSInteger gen) {
             for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
                 if (![sc isKindOfClass:[UIWindowScene class]]) continue;
                 UIWindowScene *ws = (UIWindowScene *)sc;
-                if (ws.activationState == UISceneActivationStateForegroundActive) {
-                    scene = ws;
+                if (ws.activationState == UISceneActivationStateForegroundActive) {                    scene = ws;
                     break;
                 }
                 if (!scene) scene = ws;
@@ -814,6 +842,17 @@ static void DLBioGuardTick(NSInteger gen) {
                 wantLevel);
     }
     win.windowLevel = wantLevel;
+
+    // ⭐ v0.2.1：一行「结论」日志 —— 下次排查只看这一行就能判断贴纸模式是否成立。
+    //   期望（真机）：
+    //     [锁屏探测] key window 就是锁屏 SBCoverSheetWindow level=1050 → 直接采信
+    //     ★★ [锁屏贴纸] 锁屏窗口层级=1050 → 假空间层级=1051（真机保持锁定）
+    //   若出现「未命中锁屏窗口」或「退回通用高层级策略」，说明探测又失败了。
+    DLProbe(@"[锁屏贴纸] 结论：贴纸=%@ · 层级=%.0f · 锁屏层级来源=%@",
+            DLPinnedToLockScreen() ? @"成立" : @"未成立（退回旧策略）",
+            wantLevel,
+            wantLevel > 0.0 ? @"锁屏窗口+1" : @"兜底");
+
     win.rootViewController = vc;
     sWindow = win;   // ⭐ 自己强持有（防止宿主回收，见 sWindow 注释）
     DLProbe(@"decoy 窗口层级=%.0f（呈现前最高的其它窗口=%.0f）", wantLevel, topBefore);

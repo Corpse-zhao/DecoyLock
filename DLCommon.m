@@ -229,41 +229,98 @@ void DLProbeClear(void) {
 // 我们当前是否处于「已暂停生物识别匹配」的状态（供兜底守护查询）
 static BOOL sBioMatchingOff = NO;
 
+// ⭐ v0.2.1：干预前记录「系统原本是否在匹配」，作为恢复时的兜底依据。
+//    为什么需要：万一我们的暂停成功了、但恢复路径全部没走到，
+//    下次进程内还能凭这个值把系统还原回去（不可让用户能力被永久关死）。
+static BOOL sBioWasMatching = NO;
+static BOOL sBioWasMatchingValid = NO;
+
 BOOL DLBiometricMatchingIsOff(void) { return sBioMatchingOff; }
+
+// ⭐⭐⭐ v0.2.1 重做：Face ID 临时停用（多路径探测）
+//
+// 🔥 v0.2.0 血泪：只试了 `SBUIBiometricResource -setMatchingEnabled:` 一条路，
+//    真机日志一路 `实例不支持 setMatchingEnabled: → 跳过（不干预）`
+//    → **暂停从未生效过**，刷脸自然一直在（v0.1.22/v0.1.23 的努力全白费）。
+//
+// iOS 16 实测正确的入口是 **`SBUIBiometricEventMonitor`**（不是 BiometricResource），
+// 方法名是私有的 **`_setMatchingEnabled:`**（带下划线）。
+// 为兼容性，这里按优先级**依次尝试**，并**把命中的路径打进日志** ——
+// 这样即使某个类名在这台机器上不存在，下一次日志也能告诉我们真实情况。
+//
+// 参考：theapplewiki.com Dev:BiometricKit.framework
+//   monitor = [objc_getClass("SBUIBiometricEventMonitor") sharedInstance];
+//   _wasMatching = [[monitor valueForKey:@"_matchingEnabled"] boolValue];
+//   [monitor _setMatchingEnabled:NO];   // 停：不再发起匹配
+//
+// ⚠️ 依旧全程 respondsToSelector 显式探测 —— 不存在的类/方法直接 msgSend 是崩溃级风险。
 
 void DLSetBiometricMatching(BOOL enabled) {
     // ⭐ 幂等短路：状态没变直接返回（不重复调系统 API，避免匹配抖动）
     if (enabled && !sBioMatchingOff) return;
     if (!enabled && sBioMatchingOff) return;
 
-    Class cls = objc_getClass("SBUIBiometricResource");
-    if (!cls) {
-        DLProbe(@"[FaceID] 找不到 SBUIBiometricResource → 跳过（不干预）");
-        return;
+    BOOL want = enabled;                       // 目标状态
+    BOOL wantOff = !enabled;
+
+    // 方法名候选（私有 API，不同版本名字不同，依次试）
+    NSArray<NSString *> *setterNames = @[
+        @"_setMatchingEnabled:",               // ⭐ iOS 16 实测（带下划线）
+        @"setMatchingEnabled:",                // 旧版 / 部分版本
+        @"setMatchingEnabledForFaceID:",
+    ];
+
+    // 类候选（按可靠性排序）
+    NSArray<NSString *> *classNames = @[
+        @"SBUIBiometricEventMonitor",          // ⭐ iOS 16 实测入口
+        @"SBUIBiometricResource",
+    ];
+
+    // 每次调用前，先把「当前匹配状态」记下来，便于恢复时对照
+    for (NSString *cn in classNames) {
+        Class cls = objc_getClass(cn.UTF8String);
+        if (!cls) continue;
+
+        id inst = nil;
+        if ([cls respondsToSelector:@selector(sharedInstance)]) {
+            inst = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstance));
+        }
+        if (!inst) continue;
+
+        // 命中前先把「原状态」读出来（仅首次），供恢复时兜底
+        if (sBioWasMatchingValid == NO &&
+            [inst respondsToSelector:NSSelectorFromString(@"_matchingEnabled")]) {
+            id v = ((id (*)(id, SEL))objc_msgSend)(inst, NSSelectorFromString(@"_matchingEnabled"));
+            if ([v respondsToSelector:@selector(boolValue)]) {
+                sBioWasMatching = [v boolValue];
+                sBioWasMatchingValid = YES;
+            }
+        }
+
+        for (NSString *sn in setterNames) {
+            SEL sel = NSSelectorFromString(sn);
+            if (!sel || ![inst respondsToSelector:sel]) continue;
+
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(inst, sel, want);
+            sBioMatchingOff = wantOff;     // ⚠️ 只有真正调用成功后才改状态
+            DLProbe(@"[FaceID] 已%@生物识别匹配（%@）→ 命中路径 %@ -%@",
+                    enabled ? @"恢复" : @"暂停",
+                    enabled ? @"退出假空间" : @"假空间展示期间",
+                    cn, sn);
+
+            // ⭐ 恢复时再校一次：若系统原状态本就是「不匹配」，
+            //    说明这次恢复是多余的，记一行日志便于排查抖动。
+            if (enabled && sBioWasMatchingValid && !sBioWasMatching) {
+                DLProbe(@"[FaceID] 提示：干预前系统本就未在匹配（已按原值恢复）");
+            }
+            return;
+        }
     }
 
-    id shared = nil;
-    if ([cls respondsToSelector:@selector(sharedInstance)]) {
-        shared = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstance));
-    }
-    if (!shared) {
-        DLProbe(@"[FaceID] 拿不到 SBUIBiometricResource 实例 → 跳过（不干预）");
-        return;
-    }
-
-    // ⚠️ 必须用 respondsToSelector 显式探一次再调 —— 不存在的类/方法直接
-    //    objc_msgSend 到 SBUIBiometricResource 上是**崩溃级**风险。
-    if (![shared respondsToSelector:@selector(setMatchingEnabled:)]) {
-        DLProbe(@"[FaceID] 实例不支持 setMatchingEnabled: → 跳过（不干预）");
-        return;
-    }
-
-    SEL sel = @selector(setMatchingEnabled:);
-    ((void (*)(id, SEL, BOOL))objc_msgSend)(shared, sel, enabled);
-    sBioMatchingOff = !enabled;   // ⚠️ 只有真正调用成功后才改状态
-    DLProbe(@"[FaceID] 已%@生物识别匹配（%@）",
-            enabled ? @"恢复" : @"暂停",
-            enabled ? @"退出假空间" : @"假空间展示期间");
+    // 全部路径都没命中 → 明确记日志（这条日志是下一轮的诊断依据）
+    DLProbe(@"[FaceID] ⚠️ 所有候选路径都没命中（类=%@；方法=%@）→ 无法干预生物识别",
+            [classNames componentsJoinedByString:@","],
+            [setterNames componentsJoinedByString:@","]);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +340,7 @@ BOOL DLPasscodeSessionActive(void) { return sPasscodeSession; }
 void DLBeginPasscodeSession(void) {
     if (sPasscodeSession) return;       // 已在会话中，不重复
     sPasscodeSession = YES;
-    DLProbe(@"[FaceID] 用户开始输入密码 → 提前暂停生物识别匹配（v0.1.23）");
+    DLProbe(@"[FaceID] 用户开始输入密码 → 提前暂停生物识别匹配");
     DLSetBiometricMatching(NO);
 }
 
