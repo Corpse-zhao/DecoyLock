@@ -1273,7 +1273,7 @@ static void DLEnsureReconForPasscodeField(id field) {
 // ===========================================================================
 
 static void DLDumpEnvironment(void) {
-    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.1.23 输密码即暂停 Face ID）==========", DL_VERSION);
+    DLProbe(@"========== DecoyLock %@ 启动（Tweak.x v0.2.0 不解锁真机进入假空间（锁屏贴纸））==========", DL_VERSION);
     DLProbe(@"bundle=%@ pid=%d", [NSBundle mainBundle].bundleIdentifier, (int)getpid());
     DLProbe(@"已启用=%d 伪密码已配置=%d",
             DLEnabled(), DLDecoyPasscode().length > 0);
@@ -1428,6 +1428,13 @@ static void DLLogInputCapture(NSString *src) {
     //   还是干脆放弃走开，锁屏消失都必须恢复。
     //   ⚠️⚠️ 这是防「Face ID 被永久关死」最关键的一道闸。
     DLEndPasscodeSession();
+    // ⭐⭐⭐ v0.2.0：锁屏贴纸模式下，锁屏「消失」不应发生（我们拦了解锁回调）；
+    //   万一真的发生了（系统强制收场），说明贴纸模式已经失效 →
+    //   这里解除贴纸标记 + 走常规清理，把系统还给用户，绝不硬撑。
+    if (DLPinnedToLockScreen()) {
+        DLProbe(@"⚠️ [锁屏贴纸] 锁屏意外消失 → 解除贴纸模式并清理");
+        DLUnpinFromLockScreen();
+    }
     // ⭐ v0.1.19：锁屏消失 = 用户大概率去解锁了（真实密码 / Face ID）。
     //    此时**必须**把我们自建的窗口拆掉 —— 否则它会以一个
     //    「看不见却挡触摸」的高层级窗口留在界面上，用户就会出现
@@ -1459,6 +1466,15 @@ static void DLLogInputCapture(NSString *src) {
                     dump.length ? dump : @"(无可用键)");
         } @catch (__unused NSException *e) { }
     }
+
+    // ⭐⭐⭐ v0.2.0：假空间展示期间**不发起解锁**。
+    //   这里如果 %orig，系统就会真的去校验密码/生物识别 → 真机被解开
+    //   （用户看到的就是「必须要刷脸才能进入假空间」）。
+    //   我们只要「锁屏上的贴纸」，所以直接吞掉这次解锁请求。
+    if (DLEnabled() && [DLDecoyController isShowing] && DLPinnedToLockScreen()) {
+        DLProbe(@"★★ [锁屏贴纸] 吞掉 coverSheetViewController:unlockWithRequest: → 真机不解锁");
+        return;
+    }
     %orig;
 }
 
@@ -1467,12 +1483,34 @@ static void DLLogInputCapture(NSString *src) {
                            completion:(id)completion {
     DLProbe(@"[解锁请求] coverSheetPresentationManager:unlockWithRequest:completion: 被调用 "
             @"request=%@", request);
+    // ⭐⭐⭐ v0.2.0：同上 —— 假空间展示期间不发起解锁（真机保持锁定）
+    if (DLEnabled() && [DLDecoyController isShowing] && DLPinnedToLockScreen()) {
+        DLProbe(@"★★ [锁屏贴纸] 吞掉 coverSheetPresentationManager:unlockWithRequest: → 真机不解锁");
+        return;
+    }
     %orig;
 }
 
 // 解锁**成功**回调 —— 出现它说明系统认可了这次解锁
 - (void)coverSheetViewControllerHandleUnlockAttemptSucceeded:(id)vc {
     DLProbe(@"[解锁请求] ★★ HandleUnlockAttemptSucceeded 被调用（系统认可解锁）");
+
+    // ⭐⭐⭐ v0.2.0（核心）：用户要求「**在手机不解锁的情况下**进入假空间」。
+    //   这个回调 = 系统正在把真机**真的解开**（随后就是锁屏收场 → 真桌面）。
+    //   而我们只想让假空间当一张「贴在锁屏上的贴纸」——
+    //   所以**必须在这里把它拦下来**：不调 %orig，真机保持锁定。
+    //
+    //   判据：只有「用户输的是伪密码、且假空间正在展示」时才拦。
+    //   不是这种情况（真密码 / 普通解锁）一律放行，绝不影响正常使用。
+    if (DLEnabled() && [DLDecoyController isShowing] && DLPinnedToLockScreen()) {
+        DLProbe(@"★★ [锁屏贴纸] 拦截「系统解锁」回调 → **真机保持锁定**，"
+                @"假空间仅贴在锁屏之上（不解锁、不刷脸）");
+        // ⚠️ 关键：**不做 %orig**，也不拆窗口。
+        //   系统收不到「解锁成功」，锁屏就不会收场，真机保持锁定。
+        //   用户看到的就是「锁屏上出现了一个假空间」。
+        return;
+    }
+
     // ⭐ v0.1.19：系统真的认可了解锁 = 用户已经/即将进真桌面 →
     //    我们的窗口一律拆掉（哪怕只展示了 1 秒）。这是最强的清理信号。
     DLSafeTeardownIfStale(0.5, "系统认可解锁");

@@ -14,7 +14,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#define DL_VERSION      @"0.1.23"
+#define DL_VERSION      @"0.2.0"
 #define DL_PREFS_DOMAIN @"com.blr.decoylock"
 
 // 共享配置目录（SpringBoard 进程与「设置」进程都能写的位置）
@@ -89,5 +89,26 @@ FOUNDATION_EXPORT BOOL DLBiometricMatchingIsOff(void);
 FOUNDATION_EXPORT void DLBeginPasscodeSession(void);   // 用户开始输密码 → 暂停 Face ID
 FOUNDATION_EXPORT void DLEndPasscodeSession(void);     // 会话结束 → 恢复 Face ID
 FOUNDATION_EXPORT BOOL DLPasscodeSessionActive(void);  // 是否处于输密码会话中
+
+// ⭐⭐⭐ v0.2.0：**在不解锁真机的前提下进入假空间**（本项目的正确形态）
+//
+// 用户明确要求（2026-10-06 14:27）：
+//   「我的要求是，**在手机不解锁的情况下进入假空间**，
+//     现在都是输入完假空间密码，必须要刷脸才能进入假空间」
+//
+// 此前 v0.1.x 全部走的是「让系统先解锁 → 假空间盖在真桌面上」这条路 ——
+// 所以**必然要刷脸**（区别只是闪不闪一下）。
+//
+// 正确做法：假空间 = **贴在锁屏上面的一层**，真机自始至终保持锁定。
+// 前置条件：① 不发起任何解锁请求（不调系统解锁）；
+//          ② 窗口挂在**锁屏所在的 scene + lockScreen 窗口层级之上**，
+//             而不是挂在「解锁后才出现的最顶层」之上；
+//          ③ 期间压制 Face ID 匹配（沿用 v0.1.23 的会话机制）。
+//
+// ⚠️ 安全约束：一旦离开假空间，必须恢复到「正常锁屏」状态，绝不能让用户
+//    卡在一个既进不去真系统、也回不到锁屏的死角。
+FOUNDATION_EXPORT void DLPinToLockScreen(void);        // 进入「锁屏贴纸」模式
+FOUNDATION_EXPORT void DLUnpinFromLockScreen(void);    // 退出该模式
+FOUNDATION_EXPORT BOOL DLPinnedToLockScreen(void);     // 是否处于该模式
 
 #endif /* DLCommon_h */

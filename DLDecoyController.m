@@ -228,6 +228,9 @@ static void DLResumeBiometric(void);
 static void DLTeardownWindow(UIWindow *win);
 static void DLRestoreKeyWindow(void);
 static NSArray<UIWindow *> *DLAllWindows(void);
+// ⭐ v0.2.0：锁屏态探测（定义在 DLSceneOwningTopWindow 之前）
+static CGFloat DLLockScreenWindowLevel(void);
+static UIWindowScene *DLSceneOwningLockScreen(void);
 
 
 + (DLPasscodeVerdict)handleCapturedPasscode:(NSString *)digits {
@@ -457,6 +460,81 @@ static CGFloat DLMaxOtherWindowLevelVerbose(BOOL verbose) {
     return maxLv;
 }
 
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐ v0.2.0：锁屏态探测（「不解锁真机进入假空间」的基石）
+//
+// 为什么需要它：v0.1.x 用「现存最高窗口 + 1000」来定层级，这条路径的实际效果是
+//   「系统先解锁 → 我们盖在真桌面上」→ **必然刷脸**。
+// 用户 2026-10-06 明确要求：「在手机不解锁的情况下进入假空间」。
+//
+// 做法：找到**锁屏自己的那个窗口**（CSCoverSheetView / SBLockScreenView 等），
+//   把层级定在「它之上一点点」——
+//   既能盖住锁屏 UI，又**不会越到解锁后才存在的那一层**。
+//
+// ⚠️ 全程保护：找不到就返回 0，调用方退回旧策略（最差等于 v0.1.x，不会更坏）。
+// ---------------------------------------------------------------------------
+
+// 锁屏窗口的类名（按优先级：越靠前越「就是锁屏本身」）
+static NSArray<NSString *> *DLLockScreenClassNames(void) {
+    return @[
+        @"CSCoverSheetView",
+        @"SBLockScreenView",
+        @"SBFLockScreenDateView",
+        @"CSCombinedListViewController",
+        @"CoverSheetView",
+    ];
+}
+
+// 返回锁屏窗口的层级；探测不到返回 0
+static CGFloat DLLockScreenWindowLevel(void) {
+    CGFloat found = 0.0;
+    for (UIWindow *w in DLAllWindows()) {
+        if (!w || w == sWindow) continue;
+        NSString *cls = NSStringFromClass(object_getClass(w));
+        for (NSString *want in DLLockScreenClassNames()) {
+            if ([cls isEqualToString:want] ||
+                [cls rangeOfString:want].location != NSNotFound) {
+                if (w.windowLevel > found) found = w.windowLevel;
+                DLProbe(@"[锁屏探测] 命中锁屏窗口 %@ level=%.0f hidden=%d",
+                        cls, w.windowLevel, (int)w.hidden);
+                break;
+            }
+        }
+        // 兜底：类名不认识时，用「层级很高且正在显示的窗口」做近似判据。
+        // iOS 16 的锁屏层级通常在 3000~4000 区间（远低于网络锁/弹窗的 10000+）。
+        if (found <= 0.0 && !w.hidden && w.windowLevel >= 1000.0 && w.windowLevel <= 8000.0) {
+            if (w.windowLevel > found) found = w.windowLevel;
+        }
+    }
+    if (found <= 0.0) {
+        DLProbe(@"[锁屏探测] 未命中锁屏窗口（类名/层级判据都没中）");
+    }
+    return found;
+}
+
+// 找出「锁屏所在的那个 scene」—— 假空间必须挂在这里，才能与锁屏同层排序
+static UIWindowScene *DLSceneOwningLockScreen(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            for (UIWindow *w in ws.windows) {
+                if (!w || w == sWindow) continue;
+                NSString *cls = NSStringFromClass(object_getClass(w));
+                for (NSString *want in DLLockScreenClassNames()) {
+                    if ([cls isEqualToString:want] ||
+                        [cls rangeOfString:want].location != NSNotFound) {
+                        DLProbe(@"[锁屏探测] 锁屏所在 scene 已锁定（activation=%ld）",
+                                (long)ws.activationState);
+                        return ws;
+                    }
+                }
+            }
+        }
+    }
+    return nil;
+}
+
 // 找出「层级最高的那个窗口」所在的 scene —— 我们的窗口挂到同一个 scene，
 // 才能保证在同一个合成上下文里排序（不同 scene 之间比层级没意义）。
 static UIWindowScene *DLSceneOwningTopWindow(void) {
@@ -657,7 +735,18 @@ static void DLBioGuardTick(NSInteger gen) {
             sPrevKeyWindow ? NSStringFromClass(object_getClass(sPrevKeyWindow)) : @"(无)");
 
     if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = DLSceneOwningTopWindow();
+        // ⭐⭐⭐ v0.2.0：**优先挂到「锁屏所在的 scene」**。
+        //   这是「不解锁真机进入假空间」的关键 —— 挂错 scene 就会跟到
+        //   「解锁后才出现的那一层」，等于又走回老路（必然刷脸）。
+        UIWindowScene *scene = DLSceneOwningLockScreen();
+        if (scene) {
+            DLProbe(@"★★ [锁屏贴纸] 假空间挂到「锁屏所在 scene」");
+            DLPinToLockScreen();      // 标记进入贴纸模式
+        }
+        if (!scene) {
+            scene = DLSceneOwningTopWindow();
+            DLProbe(@"decoy 未找到锁屏 scene → 退回「顶层窗口所属 scene」");
+        }
         if (!scene) {
             // 兜底：前台活跃的 scene
             for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -672,8 +761,7 @@ static void DLBioGuardTick(NSInteger gen) {
         }
         if (scene) {
             win = [[UIWindow alloc] initWithWindowScene:scene];
-            DLProbe(@"decoy 使用 scene（顶层窗口所属）activation=%ld",
-                    (long)scene.activationState);
+            DLProbe(@"decoy 使用 scene activation=%ld", (long)scene.activationState);
         }
     }
     if (!win) {
@@ -694,8 +782,37 @@ static void DLBioGuardTick(NSInteger gen) {
     // ⭐ v0.1.17：层级 = max(硬编码下限, 现存最高 + 1000)
     //   —— 硬编码 100000 曾被 SpringBoard 的锁屏窗口压在下面（用户实测
     //      必须刷脸解锁后才看到假空间）。探测式取值永远压在最上面。
-    CGFloat wantLevel = topBefore + 1000.0;
-    if (wantLevel < 100000.0) wantLevel = 100000.0;
+    //
+    // ⭐⭐⭐ v0.2.0（核心修复）：用户要求「**在手机不解锁的情况下**进入假空间」。
+    //   v0.1.x 全系列都用「现存最高 + 1000」—— 但那个「现存最高」在锁屏态下
+    //   往往是**系统的锁定层**，它自己会随解锁流程整体抬升；
+    //   更关键的是：这条路径的实际效果是「系统先解锁 → 我们盖在真桌面上」，
+    //   所以**必然刷脸**（区别只是闪不闪一下）。
+    //
+    //   正解 = 假空间贴在**锁屏之上、但仍属于锁屏态**：
+    //     ① 场景必须选**锁屏所在的那个 scene**（不是「解锁后才出现的最顶层」）；
+    //     ② 层级取「锁屏窗口层级 + 一个很小的增量」，而不是去追最高的那个窗口；
+    //     ③ 期间压制 Face ID（由 DLPinToLockScreen + 会话机制负责）。
+    //
+    //   效果：真机**始终锁定**，假空间只是锁屏上的一张「贴纸」。
+    CGFloat wantLevel = 0.0;
+    if (@available(iOS 13.0, *)) {
+        CGFloat lockLevel = DLLockScreenWindowLevel();
+        if (lockLevel > 0.0) {
+            // 贴在锁屏之上一点点 —— 足够盖住锁屏 UI，但**不越到解锁后的世界**
+            wantLevel = lockLevel + 1.0;
+            DLProbe(@"★★ [锁屏贴纸] 锁屏窗口层级=%.0f → 假空间层级=%.0f（真机保持锁定）",
+                    lockLevel, wantLevel);
+        }
+    }
+    if (wantLevel <= 0.0) {
+        // 兜底：探测不到锁屏窗口（极端情况）→ 退回旧的「最高+1000」策略。
+        // 这样最差也只是回到 v0.1.x 的行为，不会完全失效。
+        wantLevel = topBefore + 1000.0;
+        if (wantLevel < 100000.0) wantLevel = 100000.0;
+        DLProbe(@"⚠️ [锁屏贴纸] 未探测到锁屏窗口 → 退回通用高层级策略 wantLevel=%.0f",
+                wantLevel);
+    }
     win.windowLevel = wantLevel;
     win.rootViewController = vc;
     sWindow = win;   // ⭐ 自己强持有（防止宿主回收，见 sWindow 注释）
@@ -785,7 +902,13 @@ static void DLBioGuardTick(NSInteger gen) {
     // ⭐ v0.1.19 核心：把 key window 还给系统，否则锁屏键盘点不动
     DLRestoreKeyWindow();
 
-    // ⭐⭐ v0.1.22：**这里刻意不恢复 Face ID 匹配**。
+    // ⭐⭐⭐ v0.2.0：退出「锁屏贴纸」模式。
+    //   我们全程没有解锁真机（也没发起解锁请求），所以退出后**天然回到锁屏**，
+    //   不需要做任何「重新锁定」的动作 —— 这正是本方案安全的地方。
+    //   这里只是把状态位归零，让兜底守护/后续逻辑知道已回到常规态。
+    DLUnpinFromLockScreen();
+
+    // ⭐ v0.1.22：**这里刻意不恢复 Face ID 匹配**。
     //   本方法同时服务于「重建前清理残留」（例如守护循环复活、层级被压后重建），
     //   在这些路径上恢复匹配会立刻又被暂停 → 中间那一瞬 Face ID 真会去匹配人脸，
     //   反而把 bug 重新引回来。

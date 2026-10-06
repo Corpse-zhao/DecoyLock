@@ -440,6 +440,77 @@ jobs:
           print("✅ 会话级 Face ID 暂停/恢复完整（输入时暂停 + 锁屏消失无条件恢复）")
           PY
 
+          echo "--- 检查 19：⭐⭐⭐ 必须是「不解锁真机」形态（锁屏贴纸），不能退回「先解锁再盖窗口」---"
+          # v0.2.0：用户明确要求「在手机不解锁的情况下进入假空间」。
+          #   v0.1.x 全系列的实际形态是「系统先解锁 → 假空间盖在真桌面上」→ 必然刷脸。
+          #   正确形态 = 假空间贴在锁屏之上、真机保持锁定。
+          #   本检查强制四件事同时在位：
+          #     (a) 窗口层级要基于「锁屏窗口层级」，不是「现存最高 + 1000」；
+          #     (b) scene 要优先选「锁屏所在的 scene」；
+          #     (c) 三个解锁回调（HandleUnlockAttemptSucceeded / unlockWithRequest ×2）
+          #         都必须在「假空间展示 + 贴纸模式」下**吞掉**（不 %orig）；
+          #     (d) 必须有退出贴纸模式的出口（DLUnpinFromLockScreen）。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          ctl = io.open('DLDecoyController.m', encoding='utf-8', errors='replace').read()
+          twk = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          common_m = io.open('DLCommon.m', encoding='utf-8', errors='replace').read()
+          common_h = io.open('DLCommon.h', encoding='utf-8', errors='replace').read()
+          twk_nc = re.sub(r'//[^\n]*', '', twk)
+
+          # (a) 层级必须基于锁屏窗口
+          if 'DLLockScreenWindowLevel' not in ctl:
+              print("❌ DLDecoyController.m 缺少 DLLockScreenWindowLevel（锁屏层级探测）")
+              sys.exit(1)
+          if not re.search(r'lockLevel \+ 1\.0', ctl):
+              print("❌ 没有「锁屏层级 + 1」的贴纸层级策略 → 会退回「盖在真桌面之上」形态")
+              sys.exit(1)
+
+          # (b) scene 必须优先锁屏 scene
+          if 'DLSceneOwningLockScreen' not in ctl:
+              print("❌ 缺少 DLSceneOwningLockScreen（锁屏 scene 探测）")
+              sys.exit(1)
+          if not re.search(r'UIWindowScene \*scene = DLSceneOwningLockScreen\(\);', ctl):
+              print("❌ 呈现时没有优先选「锁屏所在 scene」→ 会跟到解锁后才出现的那一层")
+              sys.exit(1)
+
+          # (c) 三个解锁回调必须都能被吞掉
+          def hook_body(name):
+              m = re.search(r'-\s*\(void\)' + re.escape(name) + r'[^{]*\{.*?\n\}', twk_nc, re.S)
+              return m.group(0) if m else ''
+
+          for fn in ('coverSheetViewControllerHandleUnlockAttemptSucceeded:',
+                     'coverSheetViewController:'):
+              body = hook_body(fn)
+              if not body:
+                  print("❌ 找不到 %s 钩子体" % fn)
+                  sys.exit(1)
+              if 'DLPinnedToLockScreen()' not in body:
+                  print("❌ %s 里没有「贴纸模式 → 吞掉解锁」的判断" % fn)
+                  print("   → 系统会真的把真机解开 → 用户又要刷脸（这正是本次要修的现象）")
+                  sys.exit(1)
+              if not re.search(r'DLPinnedToLockScreen\(\).*?return;', body, re.S):
+                  print("❌ %s 里判断了贴纸模式但没有提前 return（没真正吞掉）" % fn)
+                  sys.exit(1)
+
+          # 第二个 unlockWithRequest 变体
+          if twk_nc.count('DLPinnedToLockScreen()') < 3:
+              print("❌ DLPinnedToLockScreen() 出现不到 3 处 —— 两个 unlockWithRequest")
+              print("   变体 + HandleUnlockAttemptSucceeded 都应拦截")
+              sys.exit(1)
+
+          # (d) 必须能退出贴纸模式
+          if 'DLUnpinFromLockScreen' not in common_m or 'DLUnpinFromLockScreen' not in common_h:
+              print("❌ 缺少 DLUnpinFromLockScreen（没有退出贴纸模式的出口 = 用户可能卡死）")
+              sys.exit(1)
+          if 'DLUnpinFromLockScreen()' not in ctl:
+              print("❌ DLDecoyController.m 拆除路径里没有调用 DLUnpinFromLockScreen()")
+              sys.exit(1)
+
+          print("✅ 「锁屏贴纸」形态完整（锁屏层级 + 锁屏 scene + 3 处吞掉解锁 + 退出出口）")
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译（避免出一个「装上也毫无反应 / 一锁屏就安全模式」的包）"

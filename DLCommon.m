@@ -293,3 +293,30 @@ void DLEndPasscodeSession(void) {
     DLProbe(@"[FaceID] 输密码会话结束 → 恢复生物识别匹配");
     DLSetBiometricMatching(YES);
 }
+
+// ---------------------------------------------------------------------------
+// ⭐⭐⭐ v0.2.0：锁屏贴纸模式（不解锁真机进入假空间）
+//
+// 用户要求：「在手机解锁的情况下进入假空间」—— 不，是**在不解锁的情况下**。
+// 此前所有版本都走「先解锁 → 假空间盖在真桌面」，所以必然刷脸。
+//
+// 本模式只记录一个状态位，真正的窗口层级/场景选择在 DLDecoyController 里做。
+// 这里保留状态是为了：
+//   ① 让恢复逻辑能判断「当前是不是锁屏贴纸模式」；
+//   ② 让兜底守护知道该不该压制 Face ID。
+// ---------------------------------------------------------------------------
+static BOOL sPinnedToLock = NO;
+
+BOOL DLPinnedToLockScreen(void) { return sPinnedToLock; }
+
+void DLPinToLockScreen(void) {
+    if (sPinnedToLock) return;
+    sPinnedToLock = YES;
+    DLProbe(@"★★ [锁屏贴纸] 进入「不解锁真机」模式 —— 假空间将贴在锁屏之上");
+}
+
+void DLUnpinFromLockScreen(void) {
+    if (!sPinnedToLock) return;
+    sPinnedToLock = NO;
+    DLProbe(@"[锁屏贴纸] 退出「不解锁真机」模式 —— 恢复为正常锁屏");
+}
